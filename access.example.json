@@ -1,0 +1,27 @@
+{
+  "allowedChannels": ["zulip:general", "slack:C0123456789", "engineering"],
+  "deniedChannels": [],
+  "requireMention": true,
+  "onUnmentioned": "drop",
+  "allowedUsers": [],
+  "deniedUsers": [],
+  "channels": {
+    "zulip:general": {
+      "requireMention": true,
+      "onUnmentioned": "queue"
+    },
+    "engineering": {
+      "onUnmentioned": "deliver_silent",
+      "silentSummary": {
+        "enabled": true,
+        "bufferMessages": 10,
+        "bufferSeconds": 60,
+        "flushOnMentioned": true
+      }
+    }
+  },
+  "silentSummary": {
+    "enabled": false
+  },
+  "botGuardrail": "count"
+}
