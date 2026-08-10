@@ -10,12 +10,13 @@
  *                        GET /sse?channels=zulip:general,slack:C0123456789 filter,
  *                        plus /health /status /logs
  *   - --inbound tmux --target sess:win.pane [--tmux-sock path]:
+ *   - --inbound herdr --target w1:p3:
  *                        paste into a terminal multiplexer pane
  *
  * Outbound: generic MCP tools (chat_reply, chat_react, chat_typing,
  * fetch_messages, upload_file) routed by target platform — see src/tools.ts.
  *
- * Flags: --sse | --port N | --inbound tmux | --target <pane> |
+ * Flags: --sse | --port N | --inbound tmux|herdr | --target <pane> |
  *        --tmux-sock <path> | --env <path> | --access-file <path> | --help
  *
  * Environment:
@@ -60,6 +61,7 @@ import {
   type GuardrailState,
 } from './core/bot-guardrail.js'
 import type { Multiplexer } from './mux/mux.js'
+import { HerdrMultiplexer } from './mux/herdr.js'
 import { TmuxMultiplexer } from './mux/tmux.js'
 import type {
   ChannelTarget,
@@ -95,8 +97,9 @@ if (process.argv.includes('--help')) {
     `\n` +
     `Inbound delivery:\n` +
     `  (default)              MCP notifications/claude/channel into the connected client(s)\n` +
-    `  --inbound tmux         paste inbound messages into a terminal multiplexer pane\n` +
-    `  --target sess:win.pane tmux pane target (required with --inbound tmux)\n` +
+    `  --inbound tmux         paste inbound messages into a tmux pane\n` +
+    `  --inbound herdr        paste inbound messages into a herdr pane\n` +
+    `  --target <pane>        tmux pane or herdr pane ID (required with --inbound tmux|herdr)\n` +
     `  --tmux-sock <path>     custom tmux socket path\n` +
     `\n` +
     `Config:\n` +
@@ -118,22 +121,24 @@ loadEnvFile(join(homedir(), '.instant-connect', '.env'))
 // ── Inbound mode flags ───────────────────────────────────────────────────────
 
 const INBOUND_MODE = flagValue('--inbound')
-if (INBOUND_MODE !== undefined && INBOUND_MODE !== 'tmux') {
-  process.stderr.write(`${SERVER_NAME}: unsupported --inbound "${INBOUND_MODE}" (only "tmux" is supported)\n`)
+if (INBOUND_MODE !== undefined && INBOUND_MODE !== 'tmux' && INBOUND_MODE !== 'herdr') {
+  process.stderr.write(`${SERVER_NAME}: unsupported --inbound "${INBOUND_MODE}" (supported: "tmux", "herdr")\n`)
   process.exit(1)
 }
 
-const TMUX_TARGET = flagValue('--target')
+const MUX_TARGET = flagValue('--target')
 const TMUX_SOCK = flagValue('--tmux-sock')
 
-if (INBOUND_MODE === 'tmux' && !TMUX_TARGET) {
-  process.stderr.write(`${SERVER_NAME}: --target is required when --inbound tmux\n`)
+if (INBOUND_MODE !== undefined && !MUX_TARGET) {
+  process.stderr.write(`${SERVER_NAME}: --target is required when --inbound tmux|herdr\n`)
   process.exit(1)
 }
 
 const mux: Multiplexer | null = INBOUND_MODE === 'tmux'
   ? new TmuxMultiplexer(TMUX_SOCK)
-  : null
+  : INBOUND_MODE === 'herdr'
+    ? new HerdrMultiplexer()
+    : null
 let muxTargetMissingLogged = false
 
 // ── Configuration ────────────────────────────────────────────────────────────
@@ -278,7 +283,7 @@ async function deliverChannelNotification(
   debugId?: string,
 ): Promise<number> {
   if (mux) {
-    const result = await mux.paste(TMUX_TARGET!, payload)
+    const result = await mux.paste(MUX_TARGET!, payload)
     if (result.ok) {
       muxTargetMissingLogged = false
       if (debugId) debugLog(`${SERVER_NAME}: mux-deliver id=${debugId} result=ok attempts=${result.attempts}\n`)
@@ -286,7 +291,7 @@ async function deliverChannelNotification(
     }
     if (result.error === 'pane not found') {
       if (!muxTargetMissingLogged) {
-        process.stderr.write(`${SERVER_NAME}: tmux pane "${TMUX_TARGET}" not found — dropping inbound\n`)
+        process.stderr.write(`${SERVER_NAME}: ${mux.name} pane "${MUX_TARGET}" not found — dropping inbound\n`)
         muxTargetMissingLogged = true
       } else {
         debugLog(`${SERVER_NAME}: mux-deliver id=${debugId} result=pane_missing (suppressed)\n`)

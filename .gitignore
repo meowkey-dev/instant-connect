@@ -3,3 +3,8 @@ dist
 .env
 access.json
 *.done
+
+# local agent skill installs (e.g. herdr)
+.agents/
+.claude/
+skills-lock.json

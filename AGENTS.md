@@ -41,7 +41,8 @@ src/
 │   └── slack.ts             # @slack/bolt Socket Mode adapter
 └── mux/
     ├── mux.ts               # Multiplexer interface (paste/capturePane)
-    └── tmux.ts              # tmux impl (paste-buffer + capture-verify + Enter retries)
+    ├── tmux.ts              # tmux impl (paste-buffer + capture-verify + Enter retries)
+    └── herdr.ts             # herdr CLI impl (send-text + send-keys Enter + read-verify)
 test/                        # tsx --test unit tests, one file per module
 scripts/bundle.mjs           # esbuild → dist/server.js (self-contained)
 ```
@@ -57,7 +58,8 @@ scripts/bundle.mjs           # esbuild → dist/server.js (self-contained)
   bot-loop guardrail → silent/queue buffering → `<channel>` XML tag →
   delivery. Delivery modes: stdio MCP `notifications/claude/channel`
   (default), SSE multi-client with `?channels=` filter (`--sse --port N`),
-  or mux paste (`--inbound tmux --target sess:win.pane`).
+  or mux paste (`--inbound tmux --target sess:win.pane` or
+  `--inbound herdr --target w1:p3`).
 - **Platform enablement is env-driven**: zulip iff `ZULIP_SITE` +
   `ZULIP_EMAIL` + `ZULIP_API_KEY`; slack iff `SLACK_BOT_TOKEN` +
   `SLACK_APP_TOKEN`. Both can run in one process.
@@ -84,7 +86,8 @@ node dist/server.js --help
   `slackThreadTs`, `botIsMentioned`, `shouldDeliver`). When adding logic,
   prefer extracting a pure helper + test over testing through I/O.
 - Injectable deps for OS-level side effects (see `TmuxInboundDeps` in
-  `mux/tmux.ts`) — do not mock ESM module namespaces in tests.
+  `mux/tmux.ts` / `HerdrInboundDeps` in `mux/herdr.ts`) — do not mock ESM
+  module namespaces in tests.
 - Platform capabilities differ by design: Slack `setTyping` is a documented
   no-op; only Zulip chunks long messages (`maxMessageLength`); Slack posts
   single messages (~40k limit). Don't "fix" these to be uniform.
@@ -107,7 +110,8 @@ node dist/server.js --help
 ## Adding a new multiplexer
 
 Implement `Multiplexer` (`src/mux/mux.ts`: `paste`, `capturePane`) alongside
-`tmux.ts`, then wire it into the `--inbound` flag handling in `index.ts`.
+`tmux.ts`/`herdr.ts`, then wire it into the `--inbound` flag handling in
+`index.ts`.
 
 ## Gotchas
 

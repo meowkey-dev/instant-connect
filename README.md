@@ -8,7 +8,7 @@ platform-neutral core:
   optionally buffered/summarized, wrapped in a `<channel ...>` XML tag, and
   delivered to the agent either as MCP `notifications/claude/channel`
   (stdio or SSE transport) or by pasting into a terminal multiplexer pane
-  (tmux first, behind a `Multiplexer` interface).
+  (tmux and herdr, behind a `Multiplexer` interface).
 - **Outbound** replies go through generic MCP tools (`chat_reply`,
   `chat_react`, `chat_typing`, `fetch_messages`, `upload_file`) routed by
   target platform.
@@ -29,8 +29,8 @@ platform-neutral core:
             │   │  buffers ─ <channel> tag wrap            │          │
             │   └───────┬──────────────────────┬───────────┘          │
             │           │                      │                      │
-            │   core/transport.ts      mux/tmux.ts (Multiplexer)      │
-            │   stdio / SSE MCP        paste + Enter + verify         │
+            │   core/transport.ts      mux/tmux.ts, mux/herdr.ts (Multiplexer) │
+            │   stdio / SSE MCP        paste + Enter + verify                 │
             │   notifications/         into agent pane                │
             │   claude/channel               │                        │
             └───────────┬──────────────────────┼────────────────────────┘
@@ -102,9 +102,12 @@ node dist/server.js --sse --port 3000
 
 # tmux paste — for agents without MCP channel support
 node dist/server.js --inbound tmux --target mysession:0.0 [--tmux-sock /path/to/sock]
+
+# herdr paste — same delivery via the herdr CLI (pane IDs like w1:p3)
+node dist/server.js --inbound herdr --target w1:p3
 ```
 
-The MCP server (stdio or SSE) runs in every mode — the tmux flag only changes
+The MCP server (stdio or SSE) runs in every mode — the mux flag only changes
 how *inbound* messages reach the agent; outbound tools stay available over MCP.
 
 ## access.json
@@ -138,7 +141,7 @@ DMs skip channel filtering and mention requirements (user lists still apply).
 - Outbound text passes through as-is (Zulip markdown / Slack mrkdwn). Replies
   over 10000 chars are chunked on Zulip; Slack posts a single message
   (Slack accepts ~40k chars per message).
-- The `claude/channel` MCP capability is experimental in Claude Code; tmux
+- The `claude/channel` MCP capability is experimental in Claude Code; mux
   paste mode is the fallback for agents without it.
 
 ## Development
@@ -151,5 +154,5 @@ node dist/server.js --help
 ```
 
 Layout: `src/core/` platform-neutral modules, `src/platforms/` adapters,
-`src/mux/` multiplexer delivery, `src/tools.ts` generic MCP tools,
-`src/index.ts` entry + inbound pipeline. Tests in `test/`.
+`src/mux/` multiplexer delivery (tmux, herdr), `src/tools.ts` generic MCP
+tools, `src/index.ts` entry + inbound pipeline. Tests in `test/`.
