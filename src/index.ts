@@ -61,6 +61,7 @@ import {
   type GuardrailState,
 } from './core/bot-guardrail.js'
 import type { Multiplexer } from './mux/mux.js'
+import { acquireMuxLock, LockHeldError, type MuxLock } from './mux/lock.js'
 import { HerdrMultiplexer } from './mux/herdr.js'
 import { TmuxMultiplexer } from './mux/tmux.js'
 import type {
@@ -100,6 +101,7 @@ if (process.argv.includes('--help')) {
     `  --inbound tmux         paste inbound messages into a tmux pane\n` +
     `  --inbound herdr        paste inbound messages into a herdr pane\n` +
     `  --target <pane>        tmux pane or herdr pane ID (required with --inbound tmux|herdr)\n` +
+    `                         (the pane must exist at startup — canonicalize is fail-closed)\n` +
     `  --tmux-sock <path>     custom tmux socket path\n` +
     `\n` +
     `Config:\n` +
@@ -141,12 +143,83 @@ const mux: Multiplexer | null = INBOUND_MODE === 'tmux'
     : null
 let muxTargetMissingLogged = false
 
+// ── Error + signal handlers ────────────────────────────────────────────────
+// Registered before lock acquisition: a non-LockHeldError acquisition failure
+// (EACCES/ENOSPC) surfaces here instead of Node's raw-stack default, and a
+// SIGTERM/SIGINT in the startup window still releases the lock. `platforms`
+// and `muxLock` are declared up front so shutdown can run before either is
+// populated.
+process.on('unhandledRejection', err => {
+  process.stderr.write(`${SERVER_NAME}: unhandled rejection: ${err}\n`)
+})
+process.on('uncaughtException', err => {
+  process.stderr.write(`${SERVER_NAME}: uncaught exception: ${err}\n`)
+})
+
+const platforms = new Map<PlatformName, ChatPlatform>()
+
+let muxLock: MuxLock | null = null
+
+function shutdown(): void {
+  process.stderr.write(`${SERVER_NAME}: shutting down\n`)
+  muxLock?.release()
+  for (const p of platforms.values()) p.stop?.().catch(() => {})
+  setTimeout(() => process.exit(0), 2000)
+}
+process.on('SIGTERM', shutdown)
+process.on('SIGINT', shutdown)
+
+// Canonical pane target, used for BOTH the lock and pasting: resolves aliases
+// so spellings of the same pane ("mysess:1.1" vs "%5") share one lockfile, and
+// the tmux pane id (%N) stays valid across later window/session renames.
+// Fail-closed: a throwing canonicalize is a pane-reachability error — exit
+// rather than fall back to the raw spelling, which would silently narrow the
+// lock guarantee exactly when tmux is behaving oddly.
+let muxPane: string | null = null
+if (mux) {
+  muxPane = MUX_TARGET!
+  if (mux.canonicalize) {
+    try {
+      muxPane = await mux.canonicalize(MUX_TARGET!)
+    } catch (err) {
+      process.stderr.write(
+        `${SERVER_NAME}: could not resolve ${mux.name} target "${MUX_TARGET}" ` +
+        `(${(err as Error).message}) — refusing to start\n`,
+      )
+      process.exit(1)
+    }
+    if (muxPane !== MUX_TARGET) {
+      process.stderr.write(
+        `${SERVER_NAME}: ${mux.name} target "${MUX_TARGET}" resolves to canonical pane "${muxPane}"\n`,
+      )
+    }
+  }
+  try {
+    muxLock = acquireMuxLock(join(homedir(), '.instant-connect', 'locks'), mux.name, muxPane)
+    process.stderr.write(`${SERVER_NAME}: ${mux.name} inbound lock acquired for "${muxPane}" (${muxLock.path})\n`)
+  } catch (err) {
+    if (err instanceof LockHeldError) {
+      process.stderr.write(
+        `${SERVER_NAME}: another process is already delivering to ${mux.name} pane "${muxPane}" — ` +
+        `refusing to start (${err.message})\n`,
+      )
+      process.exit(1)
+    }
+    // Non-LockHeldError (EACCES/ENOSPC on the lock dir): exit rather than let
+    // the early uncaughtException handler log-and-continue, which would leave
+    // the process up with no lock and the pane unprotected.
+    process.stderr.write(
+      `${SERVER_NAME}: could not acquire ${mux.name} inbound lock for "${muxPane}" — ` +
+      `${(err as Error).message} — refusing to start\n`,
+    )
+    process.exit(1)
+  }
+}
+
 // ── Configuration ────────────────────────────────────────────────────────────
 
 const ACCESS_FILE = flagValue('--access-file') ?? process.env.ACCESS_FILE ?? join(process.cwd(), 'access.json')
 const PORT = parseInt(flagValue('--port') ?? process.env.PORT ?? '3000', 10)
-
-const platforms = new Map<PlatformName, ChatPlatform>()
 
 const { ZULIP_SITE, ZULIP_EMAIL, ZULIP_API_KEY, SLACK_BOT_TOKEN, SLACK_APP_TOKEN } = process.env
 
@@ -158,6 +231,7 @@ if (SLACK_BOT_TOKEN && SLACK_APP_TOKEN) {
 }
 
 if (platforms.size === 0) {
+  muxLock?.release()
   process.stderr.write(
     `${SERVER_NAME}: no platform credentials configured — set at least one of:\n` +
     `  Zulip: ZULIP_SITE=https://myorg.zulipchat.com ZULIP_EMAIL=bot@myorg.zulipchat.com ZULIP_API_KEY=...\n` +
@@ -168,13 +242,6 @@ if (platforms.size === 0) {
 }
 
 process.stderr.write(`${SERVER_NAME}: platforms enabled: ${[...platforms.keys()].join(', ')}\n`)
-
-process.on('unhandledRejection', err => {
-  process.stderr.write(`${SERVER_NAME}: unhandled rejection: ${err}\n`)
-})
-process.on('uncaughtException', err => {
-  process.stderr.write(`${SERVER_NAME}: uncaught exception: ${err}\n`)
-})
 
 // ── Shared bridge state ─────────────────────────────────────────────────────
 
@@ -283,7 +350,7 @@ async function deliverChannelNotification(
   debugId?: string,
 ): Promise<number> {
   if (mux) {
-    const result = await mux.paste(MUX_TARGET!, payload)
+    const result = await mux.paste(muxPane!, payload)
     if (result.ok) {
       muxTargetMissingLogged = false
       if (debugId) debugLog(`${SERVER_NAME}: mux-deliver id=${debugId} result=ok attempts=${result.attempts}\n`)
@@ -291,7 +358,7 @@ async function deliverChannelNotification(
     }
     if (result.error === 'pane not found') {
       if (!muxTargetMissingLogged) {
-        process.stderr.write(`${SERVER_NAME}: ${mux.name} pane "${MUX_TARGET}" not found — dropping inbound\n`)
+        process.stderr.write(`${SERVER_NAME}: ${mux.name} pane "${muxPane}" not found — dropping inbound\n`)
         muxTargetMissingLogged = true
       } else {
         debugLog(`${SERVER_NAME}: mux-deliver id=${debugId} result=pane_missing (suppressed)\n`)
@@ -604,14 +671,7 @@ for (const platform of platforms.values()) {
     })
   }).catch(err => {
     process.stderr.write(`${SERVER_NAME}: ${platform.name} inbound fatal: ${err}\n`)
+    muxLock?.release()
     process.exit(1)
   })
 }
-
-function shutdown(): void {
-  process.stderr.write(`${SERVER_NAME}: shutting down\n`)
-  for (const p of platforms.values()) p.stop?.().catch(() => {})
-  setTimeout(() => process.exit(0), 2000)
-}
-process.on('SIGTERM', shutdown)
-process.on('SIGINT', shutdown)

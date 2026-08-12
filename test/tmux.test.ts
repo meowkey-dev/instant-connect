@@ -1,6 +1,6 @@
 import { describe, it, beforeEach } from 'node:test'
 import assert from 'node:assert/strict'
-import { deliverToTmux } from '../src/mux/tmux.js'
+import { canonicalizeTmuxTarget, deliverToTmux } from '../src/mux/tmux.js'
 import type { TmuxInboundConfig, TmuxInboundDeps } from '../src/mux/tmux.js'
 
 // Inject fake side-effecting deps instead of monkeypatching the live
@@ -126,6 +126,45 @@ describe('deliverToTmux', () => {
     assert.equal(result.attempts, 2)
   })
 
+  it('capture failing once then clearing retries the read, ok, no extra Enter', async () => {
+    let captureCount = 0
+    execFileHandler = (_bin, args) => {
+      if (args.includes('capture-pane')) {
+        captureCount++
+        if (captureCount === 1) return { stdout: '', error: new Error('capture failed') }
+        return { stdout: 'prompt$ ' }
+      }
+      return { stdout: '' }
+    }
+
+    const result = await deliverToTmux(baseConfig, '<channel>test</channel>', deps)
+    assert.equal(result.ok, true)
+    assert.equal(result.attempts, 2)
+    assert.equal(captureCount, 2)
+    // Only the initial Enter — a read retry is not a leftover retry.
+    const enterCalls = execFileCalls.filter(call => call.args.includes('Enter'))
+    assert.equal(enterCalls.length, 1)
+  })
+
+  it('capture always failing returns "verification unreadable", Enter sent only once', async () => {
+    let captureCount = 0
+    execFileHandler = (_bin, args) => {
+      if (args.includes('capture-pane')) {
+        captureCount++
+        return { stdout: '', error: new Error('capture failed') }
+      }
+      return { stdout: '' }
+    }
+
+    const result = await deliverToTmux(baseConfig, '<channel>test</channel>', deps)
+    assert.equal(result.ok, false)
+    assert.equal(result.error, 'verification unreadable')
+    assert.equal(captureCount, 3)
+    // Only the initial Enter — no leftover was ever confirmed.
+    const enterCalls = execFileCalls.filter(call => call.args.includes('Enter'))
+    assert.equal(enterCalls.length, 1)
+  })
+
   it('multi-line payload: written to temp file for paste-buffer', async () => {
     execFileHandler = () => ({ stdout: '' })
 
@@ -161,5 +200,53 @@ describe('deliverToTmux', () => {
     for (const call of execFileCalls) {
       assert.notEqual(call.args[0], '-S', `call ${call.args.join(' ')} should not lead with socket -S`)
     }
+  })
+})
+
+describe('canonicalizeTmuxTarget', () => {
+  beforeEach(() => {
+    execFileCalls = []
+    execFileHandler = () => ({ stdout: '' })
+  })
+
+  it('resolves the target to its canonical pane id with the expected args', async () => {
+    execFileHandler = () => ({ stdout: '%5\n' })
+
+    const result = await canonicalizeTmuxTarget({ pane: 'mysess:1.1' }, deps)
+    assert.equal(result, '%5')
+    assert.equal(execFileCalls.length, 1)
+    assert.deepEqual(execFileCalls[0].args, [
+      'display-message',
+      '-p',
+      '-t',
+      'mysess:1.1',
+      '#{pane_id}',
+    ])
+  })
+
+  it('trims surrounding whitespace from the pane id response', async () => {
+    execFileHandler = () => ({ stdout: '  %7  \n' })
+    const result = await canonicalizeTmuxTarget({ pane: '%7' }, deps)
+    assert.equal(result, '%7')
+  })
+
+  it('prepends the -S socket flag when a socket is set', async () => {
+    execFileHandler = () => ({ stdout: '%3\n' })
+    const result = await canonicalizeTmuxTarget(
+      { pane: 'mysess:1.1', socket: '/tmp/test.sock' },
+      deps,
+    )
+    assert.equal(result, '%3')
+    const call = execFileCalls[0]
+    assert.equal(call.args[0], '-S')
+    assert.equal(call.args[1], '/tmp/test.sock')
+  })
+
+  it('rejects when tmux cannot resolve the target', async () => {
+    execFileHandler = (_bin, args) => {
+      if (args.includes('display-message')) return { stdout: '', error: new Error('no pane') }
+      return { stdout: '' }
+    }
+    await assert.rejects(() => canonicalizeTmuxTarget({ pane: 'nope' }, deps), /no pane/)
   })
 })

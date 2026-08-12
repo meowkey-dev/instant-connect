@@ -1,4 +1,5 @@
 import { execFile as nodeExecFile } from 'node:child_process'
+import { randomBytes } from 'node:crypto'
 
 import type { Multiplexer, MuxDeliverResult } from './mux.js'
 
@@ -20,6 +21,8 @@ export interface HerdrInboundConfig {
   sleepBeforeEnterMs?: number
   verifyDelayMs?: number
   maxRetries?: number
+  /** Unique per-delivery marker; defaults to a random `ic-<8hex>` token. */
+  marker?: string
 }
 
 export interface HerdrDeliverResult {
@@ -32,7 +35,8 @@ const DEFAULT_SLEEP_BEFORE_ENTER_MS = 2000
 const DEFAULT_VERIFY_DELAY_MS = 2000
 const DEFAULT_MAX_RETRIES = 3
 const RETRY_DELAY_MS = 500
-const VERIFY_READ_LINES = 25
+const VERIFY_READ_LINES = 50
+const MARKER_PREFIX = 'ic-'
 
 function execHerdr(
   deps: HerdrInboundDeps,
@@ -67,8 +71,14 @@ export async function deliverToHerdr(
     return { ok: false, error: 'pane not found', attempts: 0 }
   }
 
-  // 2. Send payload text (literal injection)
-  await execHerdr(deps, ['pane', 'send-text', config.pane, payload])
+  // 2. Append a short unique marker as the payload's final line and send it.
+  // Verification checks for the marker, not the full payload: a multi-line
+  // payload can exceed the read window, wrap, or carry control chars (false
+  // fail), and an identical earlier delivery could match by content alone
+  // (false pass). The marker is short and single-line, and gets submitted
+  // with the message, so it is harmless outside the XML-ish wrapper.
+  const marker = config.marker ?? `${MARKER_PREFIX}${randomBytes(4).toString('hex')}`
+  await execHerdr(deps, ['pane', 'send-text', config.pane, `${payload}\n${marker}`])
 
   // 3. Sleep before Enter
   await sleep(sleepMs)
@@ -76,35 +86,52 @@ export async function deliverToHerdr(
   // 4. Send Enter
   await execHerdr(deps, ['pane', 'send-keys', config.pane, 'Enter'])
 
-  // 5. Verify submission — the payload should appear in the pane read output
-  // (herdr has no tmux-style [Pasted text] artifact, so presence of the
-  // payload in the captured pane is the success signal).
+  // 5. Verify submission — the marker should appear in the pane read output.
   let attempts = 1
+  let lastReadFailed = false
   await sleep(verifyMs)
 
   while (attempts <= maxRetries) {
     let captured: string
     try {
+      // Integration note (verified against the real herdr CLI with a scratch
+      // pane): a pasted input line shows up in `--source recent-unwrapped`
+      // even before Enter is submitted, and the wrapped sources (default,
+      // recent, visible) can split even a short single-line marker across
+      // visual lines in a narrow pane so it no longer matches contiguously.
+      // recent-unwrapped is therefore not just safe but strictly more correct
+      // for marker verification.
       const { stdout } = await execHerdr(
         deps,
-        ['pane', 'read', config.pane, '--lines', String(VERIFY_READ_LINES)],
+        ['pane', 'read', config.pane, '--source', 'recent-unwrapped', '--lines', String(VERIFY_READ_LINES)],
       )
       captured = stdout
+      lastReadFailed = false
     } catch {
+      // A read failure (herdr CLI error / exec timeout) is neither a marker
+      // miss nor a success: retry the READ within the attempt budget — a
+      // stuck read must never turn into a silent ok. If reads keep failing
+      // past the budget the distinct "verification unreadable" result below
+      // lets the caller log the truth.
+      lastReadFailed = true
+      attempts++
+      await sleep(RETRY_DELAY_MS)
+      continue
+    }
+
+    if (captured.includes(marker)) {
       return { ok: true, attempts }
     }
 
-    if (captured.includes(payload)) {
-      return { ok: true, attempts }
-    }
-
-    // Retry Enter
+    // Confirmed marker-miss: resend Enter.
     await sleep(RETRY_DELAY_MS)
     await execHerdr(deps, ['pane', 'send-keys', config.pane, 'Enter'])
     attempts++
   }
 
-  return { ok: false, error: 'input did not submit', attempts }
+  return lastReadFailed
+    ? { ok: false, error: 'verification unreadable', attempts }
+    : { ok: false, error: 'input did not submit', attempts }
 }
 
 /** Multiplexer implementation backed by the herdr CLI. */
@@ -116,10 +143,18 @@ export class HerdrMultiplexer implements Multiplexer {
   }
 
   async capturePane(target: string, lines = 5): Promise<string> {
+    // Same source as the verification read (see the integration note above).
     const { stdout } = await execHerdr(
       defaultDeps,
-      ['pane', 'read', target, '--lines', String(lines)],
+      ['pane', 'read', target, '--source', 'recent-unwrapped', '--lines', String(lines)],
     )
     return stdout
+  }
+
+  async canonicalize(target: string): Promise<string> {
+    // herdr pane ids ("w1:p3") are opaque, stable, canonical handles: there
+    // are no aliases or alternate spellings (a space-padded id returns
+    // pane_not_found), so the trimmed id is already canonical.
+    return target.trim()
   }
 }

@@ -110,6 +110,15 @@ node dist/server.js --inbound herdr --target w1:p3
 The MCP server (stdio or SSE) runs in every mode — the mux flag only changes
 how *inbound* messages reach the agent; outbound tools stay available over MCP.
 
+Mux inbound is **single-instance per pane**: each process polls its own
+platform event queue, so two processes pointed at the same pane would paste
+duplicates. A lock (atomic `O_EXCL` file under `~/.instant-connect/locks`,
+holder pid + stale-pid reclaim) makes the second process exit with a clear
+error naming the holder's pid; the lock is released on shutdown. With
+`--inbound tmux|herdr` the pane must exist at startup: the target is
+canonicalized (fail-closed) before the lock is taken, so a pane that cannot
+be resolved exits with an error instead of starting unprotected.
+
 ## access.json
 
 Hot-reloaded on every inbound message; a corrupt file is renamed aside
@@ -154,5 +163,6 @@ node dist/server.js --help
 ```
 
 Layout: `src/core/` platform-neutral modules, `src/platforms/` adapters,
-`src/mux/` multiplexer delivery (tmux, herdr), `src/tools.ts` generic MCP
-tools, `src/index.ts` entry + inbound pipeline. Tests in `test/`.
+`src/mux/` multiplexer delivery (tmux, herdr) + the per-pane single-instance
+lock (`lock.ts`), `src/tools.ts` generic MCP tools, `src/index.ts` entry +
+inbound pipeline. Tests in `test/` (cross-process fixtures in `test/fixtures/`).

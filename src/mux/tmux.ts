@@ -65,6 +65,23 @@ function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms))
 }
 
+/**
+ * Resolve `config.pane` to tmux's canonical pane id ("%N", e.g. "%5"), which
+ * is stable across window/session renames. This lets different spellings of
+ * the same pane ("mysess:mywin.1", "mysess:1.1", "%5") share one lockfile.
+ */
+export async function canonicalizeTmuxTarget(
+  config: TmuxInboundConfig,
+  deps: TmuxInboundDeps = defaultDeps,
+): Promise<string> {
+  const { stdout } = await execTmux(
+    deps,
+    config,
+    ['display-message', '-p', '-t', config.pane, '#{pane_id}'],
+  )
+  return stdout.trim()
+}
+
 export async function deliverToTmux(
   config: TmuxInboundConfig,
   payload: string,
@@ -108,6 +125,7 @@ export async function deliverToTmux(
 
   // 8. Verify submission — check for leftover [Pasted text]
   let attempts = 1
+  let lastReadFailed = false
   await sleep(verifyMs)
 
   while (attempts <= maxRetries) {
@@ -115,8 +133,17 @@ export async function deliverToTmux(
     try {
       const { stdout } = await execTmux(deps, config, ['capture-pane', '-t', config.pane, '-p', '-S', '-5'])
       captured = stdout
+      lastReadFailed = false
     } catch {
-      return { ok: true, attempts }
+      // A capture failure (tmux CLI error / exec timeout) is neither a
+      // submission failure nor a success: retry the READ within the attempt
+      // budget — a stuck read must never turn into a silent ok. If reads keep
+      // failing past the budget, the distinct "verification unreadable"
+      // result below lets the caller log the truth.
+      lastReadFailed = true
+      attempts++
+      await sleep(RETRY_DELAY_MS)
+      continue
     }
 
     if (!captured.includes('[Pasted text')) {
@@ -129,7 +156,9 @@ export async function deliverToTmux(
     attempts++
   }
 
-  return { ok: false, error: 'input did not submit', attempts }
+  return lastReadFailed
+    ? { ok: false, error: 'verification unreadable', attempts }
+    : { ok: false, error: 'input did not submit', attempts }
 }
 
 /** Multiplexer implementation backed by tmux. */
@@ -149,5 +178,9 @@ export class TmuxMultiplexer implements Multiplexer {
       ['capture-pane', '-t', target, '-p', '-S', `-${lines}`],
     )
     return stdout
+  }
+
+  async canonicalize(target: string): Promise<string> {
+    return canonicalizeTmuxTarget({ pane: target, socket: this.socket })
   }
 }

@@ -42,8 +42,10 @@ src/
 └── mux/
     ├── mux.ts               # Multiplexer interface (paste/capturePane)
     ├── tmux.ts              # tmux impl (paste-buffer + capture-verify + Enter retries)
-    └── herdr.ts             # herdr CLI impl (send-text + send-keys Enter + read-verify)
+    ├── herdr.ts             # herdr CLI impl (send-text + send-keys Enter + read-verify)
+    └── lock.ts              # single-instance lock (O_EXCL + stale-pid reclaim)
 test/                        # tsx --test unit tests, one file per module
+                             # (test/fixtures/ holds cross-process child fixtures)
 scripts/bundle.mjs           # esbuild → dist/server.js (self-contained)
 ```
 
@@ -109,15 +111,25 @@ node dist/server.js --help
 
 ## Adding a new multiplexer
 
-Implement `Multiplexer` (`src/mux/mux.ts`: `paste`, `capturePane`) alongside
-`tmux.ts`/`herdr.ts`, then wire it into the `--inbound` flag handling in
-`index.ts`.
+Implement `Multiplexer` (`src/mux/mux.ts`: `paste`, `capturePane`, optional
+`canonicalize`) alongside `tmux.ts`/`herdr.ts`, then wire it into the
+`--inbound` flag handling in `index.ts`. Implement `canonicalize` when the
+mux has aliases for a pane (tmux pane id `%N`); the single-instance lock keys
+off the canonical target, so spellings of the same pane share one lockfile —
+if `canonicalize` throws, startup is fail-closed.
 
 ## Gotchas
 
 - The `claude/channel` MCP capability is experimental in Claude Code — the
   stdio/SSE delivery path depends on it; mux paste is the fallback for agents
   without it.
+- Mux inbound is single-instance per pane: a per-mux-target lock
+  (`~/.instant-connect/locks`, O_EXCL + stale-pid reclaim) makes a second
+  process targeting the same pane exit(1) instead of double-pasting; keep
+  that guard when editing `mux/lock.ts` or the acquisition in `index.ts`.
+- Herdr paste verification must read `pane read --source recent-unwrapped`
+  (empirically confirmed: input echo appears there; wrapped sources split even
+  short markers across visual lines in narrow panes).
 - Inbound for Zulip is long-polling: the process never exits on its own;
   poll errors must back off (1s→60s) and re-register on
   `BAD_EVENT_QUEUE_ID` — preserve this when editing `zulip.ts`.
