@@ -1,6 +1,6 @@
 import { describe, it, beforeEach } from 'node:test'
 import assert from 'node:assert/strict'
-import { deliverToHerdr, HerdrMultiplexer } from '../src/mux/herdr.js'
+import { deliverToHerdr, HerdrMultiplexer, parseHerdrTarget } from '../src/mux/herdr.js'
 import type { HerdrInboundConfig, HerdrInboundDeps } from '../src/mux/herdr.js'
 
 // Inject fake side-effecting deps instead of monkeypatching the live
@@ -214,6 +214,54 @@ describe('deliverToHerdr', () => {
     const enterCalls = execFileCalls.filter(call => call.args.includes('send-keys'))
     assert.equal(enterCalls.length, 1)
   })
+
+  it('no session: herdr invoked without a --session prefix', async () => {
+    execFileHandler = (_bin, args) => ({ stdout: args[1] === 'read' ? 'ic-abcdef12\n' : '' })
+
+    await deliverToHerdr(markerConfig, '<channel>test</channel>', deps)
+
+    for (const call of execFileCalls) {
+      assert.ok(!call.args.includes('--session'), `unexpected --session in ${call.args.join(' ')}`)
+      // First arg is the subcommand group ('pane') when no session is set.
+      assert.equal(call.args[0], 'pane')
+    }
+  })
+
+  it('session set: every herdr call is prefixed with --session <name>', async () => {
+    execFileHandler = (_bin, args) => ({ stdout: args.includes('read') ? 'ic-abcdef12\n' : '' })
+
+    const config: HerdrInboundConfig = { ...markerConfig, session: 'rh' }
+    const result = await deliverToHerdr(config, '<channel>test</channel>', deps)
+    assert.equal(result.ok, true)
+
+    // get, send-text, send-keys, read — all four route through the rh session.
+    assert.ok(execFileCalls.length >= 4)
+    for (const call of execFileCalls) {
+      assert.deepEqual(call.args.slice(0, 3), ['--session', 'rh', 'pane'])
+    }
+    // The pane id is passed verbatim, not the combined target.
+    const sendText = execFileCalls.find(call => call.args.includes('send-text'))
+    assert.ok(sendText)
+    assert.equal(sendText.args[4], baseConfig.pane)
+  })
+})
+
+describe('parseHerdrTarget', () => {
+  it('bare pane id → no session (default herdr server)', () => {
+    assert.deepEqual(parseHerdrTarget('w1:p3'), { pane: 'w1:p3' })
+  })
+
+  it('session@pane → session + pane split on the first @', () => {
+    assert.deepEqual(parseHerdrTarget('rh@w1:p1'), { session: 'rh', pane: 'w1:p1' })
+  })
+
+  it('trims surrounding and inner whitespace', () => {
+    assert.deepEqual(parseHerdrTarget('  rh @ w2:p9 '), { session: 'rh', pane: 'w2:p9' })
+  })
+
+  it('empty session prefix (@pane) → no session', () => {
+    assert.deepEqual(parseHerdrTarget('@w1:p3'), { pane: 'w1:p3' })
+  })
 })
 
 describe('HerdrMultiplexer.canonicalize', () => {
@@ -225,5 +273,10 @@ describe('HerdrMultiplexer.canonicalize', () => {
   it('trims surrounding whitespace', async () => {
     const mux = new HerdrMultiplexer()
     assert.equal(await mux.canonicalize('  w1:p3  '), 'w1:p3')
+  })
+
+  it('normalizes a session-prefixed target to session@pane', async () => {
+    const mux = new HerdrMultiplexer()
+    assert.equal(await mux.canonicalize('  rh @ w2:p9 '), 'rh@w2:p9')
   })
 })

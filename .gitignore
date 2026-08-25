@@ -8,3 +8,4 @@ access.json
 .agents/
 .claude/
 skills-lock.json
+package-lock.json
