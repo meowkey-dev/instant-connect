@@ -1,8 +1,7 @@
 /**
- * Multiplexer interface — delivery of inbound chat messages into a terminal
- * multiplexer pane running an agent session (for agents without MCP
- * claude/channel support). tmux is the first implementation; the interface
- * leaves room for others (zellij, etc.).
+ * Mux-target interface — delivery of inbound chat messages to an agent hosted
+ * in a terminal multiplexer (for agents without MCP claude/channel support).
+ * Implementations may use terminal input (tmux) or a native agent API (herdr).
  */
 
 export interface MuxDeliverResult {
@@ -14,8 +13,7 @@ export interface MuxDeliverResult {
 export interface Multiplexer {
   readonly name: string
   /**
-   * Paste `payload` into the pane identified by `target`
-   * (e.g. "sess:win.pane" for tmux) and submit it with Enter.
+   * Deliver `payload` to the agent identified by `target`.
    */
   paste(target: string, payload: string): Promise<MuxDeliverResult>
   /** Capture the last few lines of the pane (for verification/debugging). */

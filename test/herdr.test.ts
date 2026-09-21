@@ -1,18 +1,18 @@
 import { describe, it, beforeEach } from 'node:test'
 import assert from 'node:assert/strict'
-import { deliverToHerdr, HerdrMultiplexer, parseHerdrTarget } from '../src/mux/herdr.js'
+import {
+  deliverToHerdr,
+  HerdrMultiplexer,
+  parseHerdrAgentPaneId,
+  parseHerdrCliError,
+  parseHerdrTarget,
+} from '../src/mux/herdr.js'
 import type { HerdrInboundConfig, HerdrInboundDeps } from '../src/mux/herdr.js'
-
-// Inject fake side-effecting deps instead of monkeypatching the live
-// node:child_process ESM namespace. ESM namespace objects are spec-frozen and
-// Node >= 25 throws on assignment to them, so the old
-// "(mod as Record<string, unknown>).execFile = …" technique no longer works
-// (and never reliably rebound the static import binding anyway).
 
 type ExecFileCallback = (err: Error | null, stdout: string, stderr: string) => void
 
 let execFileCalls: Array<{ bin: string; args: string[] }> = []
-let execFileHandler: (bin: string, args: string[]) => { stdout: string; error?: Error } = () => ({
+let execFileHandler: (bin: string, args: string[]) => { stdout?: string; stderr?: string; error?: Error } = () => ({
   stdout: '',
 })
 
@@ -25,25 +25,12 @@ const deps: HerdrInboundDeps = {
   ) => {
     execFileCalls.push({ bin, args })
     const result = execFileHandler(bin, args)
-    if (result.error) {
-      cb(result.error, '', result.error.message)
-    } else {
-      cb(null, result.stdout, '')
-    }
+    cb(result.error ?? null, result.stdout ?? '', result.stderr ?? '')
     return undefined
   }) as unknown as HerdrInboundDeps['execFile'],
 }
 
-const baseConfig: HerdrInboundConfig = {
-  pane: 'w1:p3',
-  sleepBeforeEnterMs: 0,
-  verifyDelayMs: 0,
-  maxRetries: 3,
-}
-
-// Fixed marker so tests can control what the read window shows; production
-// delivers with a random per-delivery token instead.
-const markerConfig: HerdrInboundConfig = { ...baseConfig, marker: 'ic-abcdef12' }
+const baseConfig: HerdrInboundConfig = { target: 'w1:p3' }
 
 describe('deliverToHerdr', () => {
   beforeEach(() => {
@@ -51,232 +38,174 @@ describe('deliverToHerdr', () => {
     execFileHandler = () => ({ stdout: '' })
   })
 
-  it('returns pane not found when pane get fails', async () => {
-    execFileHandler = (_bin, args) => {
-      if (args.includes('get')) {
-        return { stdout: '', error: new Error('pane w9:p99 not found') }
-      }
-      return { stdout: '' }
-    }
+  it('submits the exact payload through the native agent prompt command', async () => {
+    const payload = '<channel platform="zulip" channel="eng">\nline1\nline2\n</channel>'
+    const result = await deliverToHerdr(baseConfig, payload, deps)
+
+    assert.deepEqual(result, { ok: true, attempts: 1 })
+    assert.deepEqual(execFileCalls, [{
+      bin: 'herdr',
+      args: ['agent', 'prompt', 'w1:p3', payload],
+    }])
+  })
+
+  it('does not wait for the agent turn to finish', async () => {
+    await deliverToHerdr(baseConfig, '<channel>test</channel>', deps)
+    assert.ok(!execFileCalls[0].args.includes('--wait'))
+  })
+
+  it('maps agent_not_found from structured stderr', async () => {
+    execFileHandler = () => ({
+      error: new Error('Command failed'),
+      stderr: JSON.stringify({ error: { code: 'agent_not_found', message: 'agent target w9:p9 not found' } }),
+    })
+
+    assert.deepEqual(
+      await deliverToHerdr(baseConfig, '<channel>test</channel>', deps),
+      { ok: false, error: 'agent not found', attempts: 1 },
+    )
+  })
+
+  it('maps agent_blocked from structured stderr', async () => {
+    execFileHandler = () => ({
+      error: new Error('Command failed'),
+      stderr: JSON.stringify({ error: { code: 'agent_blocked', message: 'agent is blocked' } }),
+    })
+
+    assert.deepEqual(
+      await deliverToHerdr(baseConfig, '<channel>test</channel>', deps),
+      { ok: false, error: 'agent blocked', attempts: 1 },
+    )
+  })
+
+  it('preserves other structured herdr error messages', async () => {
+    execFileHandler = () => ({
+      error: new Error('Command failed'),
+      stderr: JSON.stringify({ error: { code: 'server_not_running', message: 'no herdr server is running' } }),
+    })
+
+    assert.deepEqual(
+      await deliverToHerdr(baseConfig, '<channel>test</channel>', deps),
+      { ok: false, error: 'no herdr server is running', attempts: 1 },
+    )
+  })
+
+  it('falls back to the process error when stderr is not structured JSON', async () => {
+    execFileHandler = () => ({ error: new Error('spawn herdr ENOENT'), stderr: 'not JSON' })
 
     const result = await deliverToHerdr(baseConfig, '<channel>test</channel>', deps)
     assert.equal(result.ok, false)
-    assert.equal(result.error, 'pane not found')
-    assert.equal(result.attempts, 0)
-    // Only pane get should have been called
-    assert.equal(execFileCalls.length, 1)
-    assert.ok(execFileCalls[0].args.includes('get'))
+    assert.equal(result.error, 'herdr agent prompt failed: spawn herdr ENOENT')
   })
 
-  it('happy path: all herdr commands invoked in order, returns ok', async () => {
-    const cmdOrder: string[] = []
-    execFileHandler = (_bin, args) => {
-      cmdOrder.push(args[1])
-      // pane read must show the marker for verification to pass
-      return { stdout: args[1] === 'read' ? 'prompt$ ic-abcdef12\n' : '' }
-    }
+  it('prefixes every command with the named session', async () => {
+    const payload = '<channel>test</channel>'
+    const result = await deliverToHerdr({ target: 'assistant', session: 'rh' }, payload, deps)
 
-    const result = await deliverToHerdr(markerConfig, '<channel>hello</channel>', deps)
-    assert.equal(result.ok, true)
-    assert.equal(result.attempts, 1)
-
-    assert.deepEqual(cmdOrder, [
-      'get',
-      'send-text',
-      'send-keys', // Enter
-      'read',
+    assert.deepEqual(result, { ok: true, attempts: 1 })
+    assert.deepEqual(execFileCalls[0].args, [
+      '--session', 'rh', 'agent', 'prompt', 'assistant', payload,
     ])
-
-    // Verification reads a widened, unwrapped window.
-    const readCall = execFileCalls.find(call => call.args.includes('read'))
-    assert.ok(readCall)
-    assert.ok(readCall.args.includes('--source'))
-    assert.ok(readCall.args.includes('recent-unwrapped'))
-    assert.equal(readCall.args[readCall.args.indexOf('--lines') + 1], '50')
-  })
-
-  it('send-text receives the payload plus a trailing marker', async () => {
-    execFileHandler = () => ({ stdout: '' })
-
-    const multiLine = '<channel platform="zulip" channel="eng" thread="test">\nline1\nline2\n</channel>'
-    await deliverToHerdr(markerConfig, multiLine, deps)
-
-    const sendText = execFileCalls.find(call => call.args.includes('send-text'))
-    assert.ok(sendText, 'expected a send-text call')
-    assert.equal(sendText.args[2], baseConfig.pane)
-    assert.ok(sendText.args[3].startsWith(multiLine))
-    assert.match(sendText.args[3], /ic-[0-9a-f]{8}$/)
-  })
-
-  it('marker not visible triggers retry up to maxRetries, returns failure', async () => {
-    let readCount = 0
-    execFileHandler = (_bin, args) => {
-      if (args.includes('read')) {
-        readCount++
-        return { stdout: 'prompt$ ' }
-      }
-      return { stdout: '' }
-    }
-
-    const config: HerdrInboundConfig = { ...markerConfig, maxRetries: 2 }
-    const result = await deliverToHerdr(config, '<channel>test</channel>', deps)
-    assert.equal(result.ok, false)
-    assert.equal(result.error, 'input did not submit')
-    // initial + 1 retry = 2 read calls (maxRetries is the retry budget)
-    assert.equal(readCount, 2)
-  })
-
-  it('retry succeeds when the marker appears in read output', async () => {
-    let readCount = 0
-    execFileHandler = (_bin, args) => {
-      if (args.includes('read')) {
-        readCount++
-        if (readCount === 1) return { stdout: 'prompt$ ' }
-        return { stdout: 'prompt$ ic-abcdef12\n' }
-      }
-      return { stdout: '' }
-    }
-
-    const result = await deliverToHerdr(markerConfig, '<channel>test</channel>', deps)
-    assert.equal(result.ok, true)
-    assert.equal(result.attempts, 2)
-    // Enter sent twice: initial + one retry
-    const enterCalls = execFileCalls.filter(call => call.args.includes('send-keys'))
-    assert.equal(enterCalls.length, 2)
-  })
-
-  it('marker present without the full payload returns ok (wrap case)', async () => {
-    // A multi-line payload that exceeds the read window / wraps would make
-    // full-payload matching false-fail; the short single-line marker is what
-    // is matched instead.
-    execFileHandler = (_bin, args) => {
-      if (args.includes('read')) return { stdout: 'prompt$ ic-abcdef12\n' }
-      return { stdout: '' }
-    }
-
-    const longPayload = '<channel platform="zulip" channel="eng" thread="test">\n' +
-      'x'.repeat(400) + '\n</channel>'
-    const result = await deliverToHerdr(markerConfig, longPayload, deps)
-    assert.equal(result.ok, true)
-    assert.equal(result.attempts, 1)
-  })
-
-  it('an identical earlier payload without the marker does not false-pass', async () => {
-    // The window still shows an identical previous delivery, but not the
-    // current marker: a failed paste must report not-ok instead of matching
-    // on the stale content.
-    const payload = '<channel platform="zulip" channel="eng" thread="test">\nline1\n</channel>'
-    execFileHandler = (_bin, args) => {
-      if (args.includes('read')) return { stdout: `prompt$ ${payload}\n` }
-      return { stdout: '' }
-    }
-
-    const result = await deliverToHerdr(markerConfig, payload, deps)
-    assert.equal(result.ok, false)
-    assert.equal(result.error, 'input did not submit')
-  })
-
-  it('read failing once then marker visible retries the read, ok, no extra Enter', async () => {
-    let readCount = 0
-    execFileHandler = (_bin, args) => {
-      if (args.includes('read')) {
-        readCount++
-        if (readCount === 1) return { stdout: '', error: new Error('read failed') }
-        return { stdout: 'prompt$ ic-abcdef12\n' }
-      }
-      return { stdout: '' }
-    }
-
-    const result = await deliverToHerdr(markerConfig, '<channel>test</channel>', deps)
-    assert.equal(result.ok, true)
-    assert.equal(result.attempts, 2)
-    assert.equal(readCount, 2)
-    // Only the initial Enter — a read retry is not a marker-miss retry.
-    const enterCalls = execFileCalls.filter(call => call.args.includes('send-keys'))
-    assert.equal(enterCalls.length, 1)
-  })
-
-  it('read always failing returns "verification unreadable", Enter sent only once', async () => {
-    let readCount = 0
-    execFileHandler = (_bin, args) => {
-      if (args.includes('read')) {
-        readCount++
-        return { stdout: '', error: new Error('read failed') }
-      }
-      return { stdout: '' }
-    }
-
-    const result = await deliverToHerdr(baseConfig, '<channel>test</channel>', deps)
-    assert.equal(result.ok, false)
-    assert.equal(result.error, 'verification unreadable')
-    assert.equal(readCount, 3)
-    // Only the initial Enter — no marker-miss was ever confirmed.
-    const enterCalls = execFileCalls.filter(call => call.args.includes('send-keys'))
-    assert.equal(enterCalls.length, 1)
-  })
-
-  it('no session: herdr invoked without a --session prefix', async () => {
-    execFileHandler = (_bin, args) => ({ stdout: args[1] === 'read' ? 'ic-abcdef12\n' : '' })
-
-    await deliverToHerdr(markerConfig, '<channel>test</channel>', deps)
-
-    for (const call of execFileCalls) {
-      assert.ok(!call.args.includes('--session'), `unexpected --session in ${call.args.join(' ')}`)
-      // First arg is the subcommand group ('pane') when no session is set.
-      assert.equal(call.args[0], 'pane')
-    }
-  })
-
-  it('session set: every herdr call is prefixed with --session <name>', async () => {
-    execFileHandler = (_bin, args) => ({ stdout: args.includes('read') ? 'ic-abcdef12\n' : '' })
-
-    const config: HerdrInboundConfig = { ...markerConfig, session: 'rh' }
-    const result = await deliverToHerdr(config, '<channel>test</channel>', deps)
-    assert.equal(result.ok, true)
-
-    // get, send-text, send-keys, read — all four route through the rh session.
-    assert.ok(execFileCalls.length >= 4)
-    for (const call of execFileCalls) {
-      assert.deepEqual(call.args.slice(0, 3), ['--session', 'rh', 'pane'])
-    }
-    // The pane id is passed verbatim, not the combined target.
-    const sendText = execFileCalls.find(call => call.args.includes('send-text'))
-    assert.ok(sendText)
-    assert.equal(sendText.args[4], baseConfig.pane)
   })
 })
 
 describe('parseHerdrTarget', () => {
-  it('bare pane id → no session (default herdr server)', () => {
-    assert.deepEqual(parseHerdrTarget('w1:p3'), { pane: 'w1:p3' })
+  it('parses a bare pane id', () => {
+    assert.deepEqual(parseHerdrTarget('w1:p3'), { target: 'w1:p3' })
   })
 
-  it('session@pane → session + pane split on the first @', () => {
-    assert.deepEqual(parseHerdrTarget('rh@w1:p1'), { session: 'rh', pane: 'w1:p1' })
+  it('parses a bare agent name', () => {
+    assert.deepEqual(parseHerdrTarget('reviewer'), { target: 'reviewer' })
+  })
+
+  it('splits session@target on the first @', () => {
+    assert.deepEqual(parseHerdrTarget('rh@reviewer'), { session: 'rh', target: 'reviewer' })
   })
 
   it('trims surrounding and inner whitespace', () => {
-    assert.deepEqual(parseHerdrTarget('  rh @ w2:p9 '), { session: 'rh', pane: 'w2:p9' })
+    assert.deepEqual(parseHerdrTarget('  rh @ w2:p9 '), { session: 'rh', target: 'w2:p9' })
   })
 
-  it('empty session prefix (@pane) → no session', () => {
-    assert.deepEqual(parseHerdrTarget('@w1:p3'), { pane: 'w1:p3' })
+  it('treats an empty session prefix as the default session', () => {
+    assert.deepEqual(parseHerdrTarget('@w1:p3'), { target: 'w1:p3' })
   })
 })
 
-describe('HerdrMultiplexer.canonicalize', () => {
-  it('returns the pane id unchanged (herdr ids are canonical)', async () => {
-    const mux = new HerdrMultiplexer()
+describe('herdr response parsing', () => {
+  it('extracts the canonical pane id from agent get JSON', () => {
+    assert.equal(parseHerdrAgentPaneId(JSON.stringify({
+      id: 'cli:agent:get',
+      result: { type: 'agent_info', agent: { pane_id: 'w7:p4' } },
+    })), 'w7:p4')
+  })
+
+  it('rejects malformed or incomplete agent get responses', () => {
+    assert.throws(() => parseHerdrAgentPaneId('not JSON'), /invalid JSON/)
+    assert.throws(() => parseHerdrAgentPaneId('{"result":{}}'), /missing result\.agent\.pane_id/)
+  })
+
+  it('extracts structured CLI errors', () => {
+    assert.deepEqual(
+      parseHerdrCliError('{"error":{"code":"agent_blocked","message":"agent is blocked"}}'),
+      { code: 'agent_blocked', message: 'agent is blocked' },
+    )
+    assert.equal(parseHerdrCliError('not JSON'), undefined)
+    assert.equal(parseHerdrCliError('{"error":{"code":3,"message":"bad"}}'), undefined)
+  })
+})
+
+describe('HerdrMultiplexer', () => {
+  beforeEach(() => {
+    execFileCalls = []
+    execFileHandler = () => ({ stdout: '' })
+  })
+
+  it('canonicalizes a pane target through agent get', async () => {
+    execFileHandler = () => ({
+      stdout: JSON.stringify({ result: { agent: { pane_id: 'w1:p3' } } }),
+    })
+    const mux = new HerdrMultiplexer(deps)
+
     assert.equal(await mux.canonicalize('w1:p3'), 'w1:p3')
+    assert.deepEqual(execFileCalls[0].args, ['agent', 'get', 'w1:p3'])
   })
 
-  it('trims surrounding whitespace', async () => {
-    const mux = new HerdrMultiplexer()
-    assert.equal(await mux.canonicalize('  w1:p3  '), 'w1:p3')
+  it('resolves an agent-name alias to its pane id', async () => {
+    execFileHandler = () => ({
+      stdout: JSON.stringify({ result: { agent: { pane_id: 'w4:p2' } } }),
+    })
+    const mux = new HerdrMultiplexer(deps)
+
+    assert.equal(await mux.canonicalize('reviewer'), 'w4:p2')
   })
 
-  it('normalizes a session-prefixed target to session@pane', async () => {
-    const mux = new HerdrMultiplexer()
-    assert.equal(await mux.canonicalize('  rh @ w2:p9 '), 'rh@w2:p9')
+  it('preserves a named session on the canonical pane id', async () => {
+    execFileHandler = () => ({
+      stdout: JSON.stringify({ result: { agent: { pane_id: 'w2:p9' } } }),
+    })
+    const mux = new HerdrMultiplexer(deps)
+
+    assert.equal(await mux.canonicalize(' rh @ reviewer '), 'rh@w2:p9')
+    assert.deepEqual(execFileCalls[0].args, ['--session', 'rh', 'agent', 'get', 'reviewer'])
+  })
+
+  it('fails closed when agent get cannot resolve the target', async () => {
+    execFileHandler = () => ({
+      error: new Error('Command failed'),
+      stderr: JSON.stringify({ error: { code: 'agent_not_found', message: 'agent target gone not found' } }),
+    })
+    const mux = new HerdrMultiplexer(deps)
+
+    await assert.rejects(() => mux.canonicalize('gone'), /agent target gone not found/)
+  })
+
+  it('reads through the native agent API', async () => {
+    execFileHandler = () => ({ stdout: 'recent output' })
+    const mux = new HerdrMultiplexer(deps)
+
+    assert.equal(await mux.capturePane('w1:p3', 12), 'recent output')
+    assert.deepEqual(execFileCalls[0].args, [
+      'agent', 'read', 'w1:p3', '--source', 'recent-unwrapped', '--lines', '12',
+    ])
   })
 })
