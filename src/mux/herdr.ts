@@ -1,13 +1,8 @@
 import { execFile as nodeExecFile } from 'node:child_process'
-import { randomBytes } from 'node:crypto'
 
 import type { Multiplexer, MuxDeliverResult } from './mux.js'
 
-/**
- * Injectable side-effecting dependencies. Defaults to the real Node
- * implementation; tests pass fakes here instead of mutating frozen ESM
- * module namespaces (the latter throws on Node >= 25 — see PR notes).
- */
+/** Injectable side-effecting dependencies; tests pass fakes here. */
 export interface HerdrInboundDeps {
   execFile: typeof nodeExecFile
 }
@@ -17,30 +12,23 @@ const defaultDeps: HerdrInboundDeps = {
 }
 
 export interface HerdrInboundConfig {
-  pane: string
+  /** Live agent name or pane id accepted by `herdr agent prompt`. */
+  target: string
   /** Named herdr session (separate socket); omitted talks to the default session. */
   session?: string
-  sleepBeforeEnterMs?: number
-  verifyDelayMs?: number
-  maxRetries?: number
-  /** Unique per-delivery marker; defaults to a random `ic-<8hex>` token. */
-  marker?: string
 }
 
 /**
- * Parse a mux target of the form `<session>@<window>:<pane>` into its session
- * and pane_id parts. The session prefix (and `@`) is optional: a bare
- * `<window>:<pane>` (e.g. `w1:p3`) targets herdr's default session, matching
- * the historical single-session behaviour. The pane part is passed to herdr
- * verbatim as its opaque pane_id; only the session is peeled off here.
+ * Parse `<session>@<agent-or-pane>` into its session and native herdr agent
+ * target. A bare target talks to herdr's default session.
  */
-export function parseHerdrTarget(target: string): { session?: string; pane: string } {
+export function parseHerdrTarget(target: string): { session?: string; target: string } {
   const trimmed = target.trim()
   const at = trimmed.indexOf('@')
-  if (at === -1) return { pane: trimmed }
+  if (at === -1) return { target: trimmed }
   const session = trimmed.slice(0, at).trim()
-  const pane = trimmed.slice(at + 1).trim()
-  return session ? { session, pane } : { pane }
+  const agentTarget = trimmed.slice(at + 1).trim()
+  return session ? { session, target: agentTarget } : { target: agentTarget }
 }
 
 export interface HerdrDeliverResult {
@@ -49,33 +37,68 @@ export interface HerdrDeliverResult {
   attempts: number
 }
 
-const DEFAULT_SLEEP_BEFORE_ENTER_MS = 2000
-const DEFAULT_VERIFY_DELAY_MS = 2000
-const DEFAULT_MAX_RETRIES = 3
-const RETRY_DELAY_MS = 500
-const VERIFY_READ_LINES = 50
-const MARKER_PREFIX = 'ic-'
+export interface HerdrCliError {
+  code: string
+  message: string
+}
+
+/** Parse the structured error object emitted by the herdr CLI on stderr. */
+export function parseHerdrCliError(stderr: string): HerdrCliError | undefined {
+  try {
+    const parsed = JSON.parse(stderr) as { error?: { code?: unknown; message?: unknown } }
+    if (typeof parsed.error?.code !== 'string' || typeof parsed.error.message !== 'string') return undefined
+    return { code: parsed.error.code, message: parsed.error.message }
+  } catch {
+    return undefined
+  }
+}
+
+class HerdrCommandError extends Error {
+  constructor(
+    message: string,
+    readonly code?: string,
+  ) {
+    super(message)
+  }
+}
 
 function execHerdr(
   deps: HerdrInboundDeps,
   args: string[],
   session?: string,
 ): Promise<{ stdout: string; stderr: string }> {
-  const bin = 'herdr'
-  // Named sessions are separate herdr servers on their own sockets; `--session
-  // <name>` must lead the argv so every subcommand routes to the right one.
   const fullArgs = session ? ['--session', session, ...args] : args
   return new Promise((resolve, reject) => {
-    deps.execFile(bin, fullArgs, { timeout: 10_000 }, (err, stdout, stderr) => {
-      const subcmd = session ? fullArgs[3] ?? fullArgs[2] : fullArgs[1] ?? fullArgs[0]
-      if (err) reject(new Error(`herdr ${subcmd} failed: ${err.message}`))
-      else resolve({ stdout, stderr })
+    deps.execFile('herdr', fullArgs, { timeout: 10_000 }, (err, stdout, stderr) => {
+      if (!err) {
+        resolve({ stdout, stderr })
+        return
+      }
+
+      const cliError = parseHerdrCliError(stderr)
+      const subcmd = args.slice(0, 2).join(' ')
+      reject(new HerdrCommandError(
+        cliError?.message ?? `herdr ${subcmd} failed: ${err.message}`,
+        cliError?.code,
+      ))
     })
   })
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, ms))
+/** Resolve a live agent name or pane id to its stable pane id. */
+export function parseHerdrAgentPaneId(stdout: string): string {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(stdout)
+  } catch {
+    throw new Error('herdr agent get returned invalid JSON')
+  }
+
+  const paneId = (parsed as { result?: { agent?: { pane_id?: unknown } } }).result?.agent?.pane_id
+  if (typeof paneId !== 'string' || paneId.length === 0) {
+    throw new Error('herdr agent get response is missing result.agent.pane_id')
+  }
+  return paneId
 }
 
 export async function deliverToHerdr(
@@ -83,108 +106,48 @@ export async function deliverToHerdr(
   payload: string,
   deps: HerdrInboundDeps = defaultDeps,
 ): Promise<HerdrDeliverResult> {
-  const sleepMs = config.sleepBeforeEnterMs ?? DEFAULT_SLEEP_BEFORE_ENTER_MS
-  const verifyMs = config.verifyDelayMs ?? DEFAULT_VERIFY_DELAY_MS
-  const maxRetries = config.maxRetries ?? DEFAULT_MAX_RETRIES
-
-  // 1. Check pane exists
   try {
-    await execHerdr(deps, ['pane', 'get', config.pane], config.session)
-  } catch {
-    return { ok: false, error: 'pane not found', attempts: 0 }
-  }
-
-  // 2. Append a short unique marker as the payload's final line and send it.
-  // Verification checks for the marker, not the full payload: a multi-line
-  // payload can exceed the read window, wrap, or carry control chars (false
-  // fail), and an identical earlier delivery could match by content alone
-  // (false pass). The marker is short and single-line, and gets submitted
-  // with the message, so it is harmless outside the XML-ish wrapper.
-  const marker = config.marker ?? `${MARKER_PREFIX}${randomBytes(4).toString('hex')}`
-  await execHerdr(deps, ['pane', 'send-text', config.pane, `${payload}\n${marker}`], config.session)
-
-  // 3. Sleep before Enter
-  await sleep(sleepMs)
-
-  // 4. Send Enter
-  await execHerdr(deps, ['pane', 'send-keys', config.pane, 'Enter'], config.session)
-
-  // 5. Verify submission — the marker should appear in the pane read output.
-  let attempts = 1
-  let lastReadFailed = false
-  await sleep(verifyMs)
-
-  while (attempts <= maxRetries) {
-    let captured: string
-    try {
-      // Integration note (verified against the real herdr CLI with a scratch
-      // pane): a pasted input line shows up in `--source recent-unwrapped`
-      // even before Enter is submitted, and the wrapped sources (default,
-      // recent, visible) can split even a short single-line marker across
-      // visual lines in a narrow pane so it no longer matches contiguously.
-      // recent-unwrapped is therefore not just safe but strictly more correct
-      // for marker verification.
-      const { stdout } = await execHerdr(
-        deps,
-        ['pane', 'read', config.pane, '--source', 'recent-unwrapped', '--lines', String(VERIFY_READ_LINES)],
-        config.session,
-      )
-      captured = stdout
-      lastReadFailed = false
-    } catch {
-      // A read failure (herdr CLI error / exec timeout) is neither a marker
-      // miss nor a success: retry the READ within the attempt budget — a
-      // stuck read must never turn into a silent ok. If reads keep failing
-      // past the budget the distinct "verification unreadable" result below
-      // lets the caller log the truth.
-      lastReadFailed = true
-      attempts++
-      await sleep(RETRY_DELAY_MS)
-      continue
+    // Native delivery honors bracketed-paste mode, submits text and Enter as
+    // one ordered operation, and refuses to type into an approval/question UI.
+    // Do not --wait: inbound delivery must not wait for the agent turn to end.
+    await execHerdr(deps, ['agent', 'prompt', config.target, payload], config.session)
+    return { ok: true, attempts: 1 }
+  } catch (err) {
+    if (err instanceof HerdrCommandError) {
+      if (err.code === 'agent_not_found') return { ok: false, error: 'agent not found', attempts: 1 }
+      if (err.code === 'agent_blocked') return { ok: false, error: 'agent blocked', attempts: 1 }
+      return { ok: false, error: err.message, attempts: 1 }
     }
-
-    if (captured.includes(marker)) {
-      return { ok: true, attempts }
-    }
-
-    // Confirmed marker-miss: resend Enter.
-    await sleep(RETRY_DELAY_MS)
-    await execHerdr(deps, ['pane', 'send-keys', config.pane, 'Enter'], config.session)
-    attempts++
+    return { ok: false, error: err instanceof Error ? err.message : String(err), attempts: 1 }
   }
-
-  return lastReadFailed
-    ? { ok: false, error: 'verification unreadable', attempts }
-    : { ok: false, error: 'input did not submit', attempts }
 }
 
-/** Multiplexer implementation backed by the herdr CLI. */
+/** Multiplexer implementation backed by herdr's native agent API. */
 export class HerdrMultiplexer implements Multiplexer {
   readonly name = 'herdr'
 
+  constructor(private readonly deps: HerdrInboundDeps = defaultDeps) {}
+
   paste(target: string, payload: string): Promise<MuxDeliverResult> {
-    const { session, pane } = parseHerdrTarget(target)
-    return deliverToHerdr({ pane, session }, payload)
+    return deliverToHerdr(parseHerdrTarget(target), payload, this.deps)
   }
 
   async capturePane(target: string, lines = 5): Promise<string> {
-    // Same source as the verification read (see the integration note above).
-    const { session, pane } = parseHerdrTarget(target)
+    const { session, target: agentTarget } = parseHerdrTarget(target)
     const { stdout } = await execHerdr(
-      defaultDeps,
-      ['pane', 'read', pane, '--source', 'recent-unwrapped', '--lines', String(lines)],
+      this.deps,
+      ['agent', 'read', agentTarget, '--source', 'recent-unwrapped', '--lines', String(lines)],
       session,
     )
     return stdout
   }
 
   async canonicalize(target: string): Promise<string> {
-    // herdr pane ids ("w1:p3") are opaque, stable, canonical handles: there
-    // are no aliases or alternate spellings (a space-padded id returns
-    // pane_not_found), so the trimmed id is already canonical. Preserve the
-    // `<session>@<pane>` form (normalized) so the single-instance lock keys off
-    // a stable spelling and later paste/read calls route to the same session.
-    const { session, pane } = parseHerdrTarget(target)
+    // Resolve both pane ids and agent names through the native API. This
+    // validates reachability before locking and makes aliases share a lock.
+    const { session, target: agentTarget } = parseHerdrTarget(target)
+    const { stdout } = await execHerdr(this.deps, ['agent', 'get', agentTarget], session)
+    const pane = parseHerdrAgentPaneId(stdout)
     return session ? `${session}@${pane}` : pane
   }
 }

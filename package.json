@@ -1,7 +1,7 @@
 {
   "name": "instant-connect",
   "version": "0.1.0",
-  "description": "Unified chat-to-agent bridge: Zulip + Slack adapters over a platform-neutral core, delivering inbound messages to agentic coding sessions via MCP claude/channel notifications (stdio/SSE) or terminal-multiplexer paste",
+  "description": "Unified chat-to-agent bridge: Zulip + Slack adapters over a platform-neutral core, delivering inbound messages via MCP notifications, terminal paste, or Herdr's native agent API",
   "license": "Apache-2.0",
   "type": "module",
   "engines": {

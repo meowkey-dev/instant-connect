@@ -9,14 +9,13 @@
  *   - --sse --port N:    express SSE, per-client MCP server,
  *                        GET /sse?channels=zulip:general,slack:C0123456789 filter,
  *                        plus /health /status /logs
- *   - --inbound tmux --target sess:win.pane [--tmux-sock path]:
- *   - --inbound herdr --target w1:p3:
- *                        paste into a terminal multiplexer pane
+ *   - --inbound tmux --target sess:win.pane [--tmux-sock path]: pane paste
+ *   - --inbound herdr --target agent-or-pane: native herdr agent prompt
  *
  * Outbound: generic MCP tools (chat_reply, chat_react, chat_typing,
  * fetch_messages, upload_file) routed by target platform — see src/tools.ts.
  *
- * Flags: --sse | --port N | --inbound tmux|herdr | --target <pane> |
+ * Flags: --sse | --port N | --inbound tmux|herdr | --target <target> |
  *        --tmux-sock <path> | --env <path> | --access-file <path> | --help
  *
  * Environment:
@@ -99,9 +98,9 @@ if (process.argv.includes('--help')) {
     `Inbound delivery:\n` +
     `  (default)              MCP notifications/claude/channel into the connected client(s)\n` +
     `  --inbound tmux         paste inbound messages into a tmux pane\n` +
-    `  --inbound herdr        paste inbound messages into a herdr pane\n` +
-    `  --target <pane>        tmux pane or herdr pane ID (required with --inbound tmux|herdr)\n` +
-    `                         (the pane must exist at startup — canonicalize is fail-closed)\n` +
+    `  --inbound herdr        submit inbound messages through herdr's native agent API\n` +
+    `  --target <target>      tmux pane, or herdr agent name/pane ID (required with mux inbound)\n` +
+    `                         (the target must exist at startup — canonicalize is fail-closed)\n` +
     `  --tmux-sock <path>     custom tmux socket path\n` +
     `\n` +
     `Config:\n` +
@@ -169,9 +168,9 @@ function shutdown(): void {
 process.on('SIGTERM', shutdown)
 process.on('SIGINT', shutdown)
 
-// Canonical pane target, used for BOTH the lock and pasting: resolves aliases
-// so spellings of the same pane ("mysess:1.1" vs "%5") share one lockfile, and
-// the tmux pane id (%N) stays valid across later window/session renames.
+// Canonical pane target, used for BOTH the lock and delivery: resolves aliases
+// so spellings of the same pane (a tmux path vs "%5", or a herdr agent name vs
+// its pane id) share one lockfile. The stable pane id also survives renames.
 // Fail-closed: a throwing canonicalize is a pane-reachability error — exit
 // rather than fall back to the raw spelling, which would silently narrow the
 // lock guarantee exactly when tmux is behaving oddly.
@@ -356,12 +355,12 @@ async function deliverChannelNotification(
       if (debugId) debugLog(`${SERVER_NAME}: mux-deliver id=${debugId} result=ok attempts=${result.attempts}\n`)
       return 1
     }
-    if (result.error === 'pane not found') {
+    if (result.error === 'pane not found' || result.error === 'agent not found') {
       if (!muxTargetMissingLogged) {
-        process.stderr.write(`${SERVER_NAME}: ${mux.name} pane "${muxPane}" not found — dropping inbound\n`)
+        process.stderr.write(`${SERVER_NAME}: ${mux.name} target "${muxPane}" not found — dropping inbound\n`)
         muxTargetMissingLogged = true
       } else {
-        debugLog(`${SERVER_NAME}: mux-deliver id=${debugId} result=pane_missing (suppressed)\n`)
+        debugLog(`${SERVER_NAME}: mux-deliver id=${debugId} result=target_missing (suppressed)\n`)
       }
     } else {
       process.stderr.write(`${SERVER_NAME}: mux-deliver failed: ${result.error} (attempts=${result.attempts})\n`)

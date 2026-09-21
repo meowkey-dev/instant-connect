@@ -103,21 +103,24 @@ node dist/server.js --sse --port 3000
 # tmux paste — for agents without MCP channel support
 node dist/server.js --inbound tmux --target mysession:0.0 [--tmux-sock /path/to/sock]
 
-# herdr paste — same delivery via the herdr CLI (pane IDs like w1:p3)
-node dist/server.js --inbound herdr --target w1:p3
+# herdr native agent delivery — accepts a live agent name or pane ID
+node dist/server.js --inbound herdr --target reviewer
+# named herdr session: --target my-session@reviewer
 ```
 
 The MCP server (stdio or SSE) runs in every mode — the mux flag only changes
 how *inbound* messages reach the agent; outbound tools stay available over MCP.
 
 Mux inbound is **single-instance per pane**: each process polls its own
-platform event queue, so two processes pointed at the same pane would paste
+platform event queue, so two processes pointed at the same pane would deliver
 duplicates. A lock (atomic `O_EXCL` file under `~/.instant-connect/locks`,
 holder pid + stale-pid reclaim) makes the second process exit with a clear
 error naming the holder's pid; the lock is released on shutdown. With
-`--inbound tmux|herdr` the pane must exist at startup: the target is
-canonicalized (fail-closed) before the lock is taken, so a pane that cannot
-be resolved exits with an error instead of starting unprotected.
+`--inbound tmux|herdr` the target must exist at startup: it is canonicalized
+(fail-closed) before the lock is taken, so a target that cannot be resolved
+exits with an error instead of starting unprotected. Herdr additionally
+requires a recognized live agent and uses `agent prompt`, which submits via
+the agent's bracketed-paste mode and rejects blocked agents.
 
 ## access.json
 
