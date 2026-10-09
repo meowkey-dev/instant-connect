@@ -128,9 +128,10 @@ requires a recognized live agent and uses `agent prompt`, which submits via
 the agent's bracketed-paste mode and rejects blocked agents.
 
 Tuios requires its CLI on `PATH` and a running daemon with the native `queue`
-command (verified with 0.8.5). Startup resolves aliases to `session@window-UUID`,
+command (verified with 0.8.5). Startup resolves aliases to a stable window UUID,
 so bare and session-qualified aliases share a lock and delivery stays on that
-window when focus changes. `tuios queue` accepts the message immediately, then
+window when focus changes or the session is renamed. Remote host-qualified
+targets are not supported. `tuios queue` accepts the message immediately, then
 submits it when the recognized agent rests, without typing over an approval or
 question prompt. Success means accepted into the queue; tuios handles paste,
 Enter and submission verification. Inspect pending messages with `tuios queue

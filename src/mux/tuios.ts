@@ -92,6 +92,7 @@ export async function deliverToTuios(
 /** Multiplexer backed by tuios's native prompt queue. */
 export class TuiosMultiplexer implements Multiplexer {
   readonly name = 'tuios'
+  private readonly routes = new Map<string, TuiosInboundConfig>()
 
   constructor(
     private readonly deps: TuiosInboundDeps = defaultDeps,
@@ -99,8 +100,16 @@ export class TuiosMultiplexer implements Multiplexer {
   ) {}
 
   private config(target: string): TuiosInboundConfig {
+    const route = this.routes.get(target)
+    if (route) return route
     const parsed = parseTuiosTarget(target)
-    return { ...parsed, session: parsed.session ?? this.session }
+    const config = { ...parsed, session: parsed.session ?? this.session }
+    // Host-qualified addresses need a separate remote identity and routing
+    // contract. Never let a remote lookup silently become local delivery.
+    if (config.session?.includes(':') || config.target.includes(':')) {
+      throw new Error('tuios remote targets are not supported')
+    }
+    return config
   }
 
   paste(target: string, payload: string): Promise<MuxDeliverResult> {
@@ -123,6 +132,9 @@ export class TuiosMultiplexer implements Multiplexer {
     if (typeof session !== 'string' || !session) {
       throw new Error('tuios session-info response is missing session_name')
     }
+    if (session.includes(':') || sessionInfo.host) {
+      throw new Error('tuios remote targets are not supported')
+    }
     // Let tuios resolve names, indices and prefixes; ambiguous aliases fail.
     // Pin the session too, so later focus changes cannot redirect delivery.
     const state = parseTuiosResponse(await execTuios(
@@ -132,6 +144,10 @@ export class TuiosMultiplexer implements Multiplexer {
     if (typeof window !== 'string' || !window) {
       throw new Error('tuios get-agent-state response is missing window_id')
     }
-    return `${session}@${window}`
+    // Window UUIDs are globally unique. Session names are mutable, and old
+    // names remain aliases after rename, so they cannot be part of the lock.
+    // Keep routing separately to avoid reparsing session names containing @.
+    this.routes.set(window, { session, target: window })
+    return window
   }
 }

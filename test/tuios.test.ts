@@ -127,8 +127,8 @@ describe('TuiosMultiplexer', () => {
     const mux = new TuiosMultiplexer(deps, '')
     for (const alias of ['reviewer', '0', '3c89f442', windowId, 'dev@reviewer', `dev@${windowId}`]) {
       const canonical = await mux.canonicalize(alias)
-      assert.equal(canonical, `dev@${windowId}`)
-      assert.equal(lockFileName('tuios', canonical), lockFileName('tuios', `dev@${windowId}`))
+      assert.equal(canonical, windowId)
+      assert.equal(lockFileName('tuios', canonical), lockFileName('tuios', windowId))
     }
     assert.deepEqual(calls.slice(0, 2).map(call => call.args), [
       ['session-info', '--json'],
@@ -149,6 +149,52 @@ describe('TuiosMultiplexer', () => {
     const target = await mux.canonicalize('reviewer')
     await mux.paste(target, 'test')
     assert.deepEqual(calls[2].args, ['queue', '-s', 'dev', '-w', windowId, '--json', '--', 'test'])
+  })
+
+  it('keeps session names containing @ intact after canonicalization', async () => {
+    handler = args => ({ stdout: json(args[0] === 'session-info'
+      ? { session_name: 'dev@work' }
+      : args[0] === 'get-agent-state' ? { window_id: windowId } : { id: 'q1' }) })
+    const mux = new TuiosMultiplexer(deps, 'dev@work')
+    const target = await mux.canonicalize('reviewer')
+    assert.equal(target, windowId)
+    await mux.paste(target, 'test')
+    assert.deepEqual(calls[2].args, ['queue', '-s', 'dev@work', '-w', windowId, '--json', '--', 'test'])
+  })
+
+  it('shares one lock identity across session renames and keeps the old route', async () => {
+    const before = new TuiosMultiplexer(deps, 'dev')
+    const oldTarget = await before.canonicalize('reviewer')
+    handler = args => ({ stdout: json(args[0] === 'session-info'
+      ? { session_name: 'renamed' }
+      : args[0] === 'get-agent-state' ? { window_id: windowId } : { id: 'q1' }) })
+    const after = new TuiosMultiplexer(deps, 'renamed')
+    const newTarget = await after.canonicalize('reviewer')
+    assert.equal(lockFileName('tuios', oldTarget), lockFileName('tuios', newTarget))
+    await before.paste(oldTarget, 'test')
+    assert.deepEqual(calls.at(-1)?.args, ['queue', '-s', 'dev', '-w', windowId, '--json', '--', 'test'])
+    await after.paste(newTarget, 'test')
+    assert.deepEqual(calls.at(-1)?.args, ['queue', '-s', 'renamed', '-w', windowId, '--json', '--', 'test'])
+  })
+
+  it('rejects host-qualified addresses before looking up any window', async () => {
+    const mux = new TuiosMultiplexer(deps, '')
+    for (const target of ['host:dev@reviewer', 'host:dev:reviewer']) {
+      await assert.rejects(() => mux.canonicalize(target), /remote targets are not supported/)
+    }
+    await assert.rejects(() => new TuiosMultiplexer(deps, 'host:dev').canonicalize('reviewer'), /remote targets are not supported/)
+    assert.equal(calls.length, 0)
+  })
+
+  it('rejects resolved host routing before looking up a window', async () => {
+    const mux = new TuiosMultiplexer(deps, '')
+    for (const fields of [{ session_name: 'host:dev' }, { session_name: 'dev', host: 'build' }]) {
+      calls = []
+      handler = () => ({ stdout: json(fields) })
+      await assert.rejects(() => mux.canonicalize('reviewer'), /remote targets are not supported/)
+      assert.equal(calls.length, 1)
+      assert.equal(calls[0].args[0], 'session-info')
+    }
   })
 
   it('fails closed for missing or ambiguous targets and incomplete JSON', async () => {
