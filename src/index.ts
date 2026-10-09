@@ -11,11 +11,12 @@
  *                        plus /health /status /logs
  *   - --inbound tmux --target sess:win.pane [--tmux-sock path]: pane paste
  *   - --inbound herdr --target agent-or-pane: native herdr agent prompt
+ *   - --inbound tuios --target session@window: native tuios prompt queue
  *
  * Outbound: generic MCP tools (chat_reply, chat_react, chat_typing,
  * fetch_messages, upload_file) routed by target platform — see src/tools.ts.
  *
- * Flags: --sse | --port N | --inbound tmux|herdr | --target <target> |
+ * Flags: --sse | --port N | --inbound tmux|herdr|tuios | --target <target> |
  *        --tmux-sock <path> | --env <path> | --access-file <path> | --help
  *
  * Environment:
@@ -63,6 +64,7 @@ import type { Multiplexer } from './mux/mux.js'
 import { acquireMuxLock, LockHeldError, type MuxLock } from './mux/lock.js'
 import { HerdrMultiplexer } from './mux/herdr.js'
 import { TmuxMultiplexer } from './mux/tmux.js'
+import { TuiosMultiplexer } from './mux/tuios.js'
 import type {
   ChannelTarget,
   ChatPlatform,
@@ -75,7 +77,7 @@ import { SlackPlatform } from './platforms/slack.js'
 import { MCP_INSTRUCTIONS, registerChatTools, type BridgeContext } from './tools.js'
 
 const SERVER_NAME = 'instant-connect'
-const SERVER_VERSION = '0.1.0'
+const SERVER_VERSION = '0.2.0'
 
 // ── Flags ────────────────────────────────────────────────────────────────────
 
@@ -99,7 +101,9 @@ if (process.argv.includes('--help')) {
     `  (default)              MCP notifications/claude/channel into the connected client(s)\n` +
     `  --inbound tmux         paste inbound messages into a tmux pane\n` +
     `  --inbound herdr        submit inbound messages through herdr's native agent API\n` +
-    `  --target <target>      tmux pane, or herdr agent name/pane ID (required with mux inbound)\n` +
+    `  --inbound tuios        queue inbound messages through tuios's native agent API\n` +
+    `  --target <target>      tmux pane, herdr agent/pane, or tuios [session@]window\n` +
+    `                         (required with mux inbound; tuios defaults to TUIOS_SESSION)\n` +
     `                         (the target must exist at startup — canonicalize is fail-closed)\n` +
     `  --tmux-sock <path>     custom tmux socket path\n` +
     `\n` +
@@ -122,8 +126,8 @@ loadEnvFile(join(homedir(), '.instant-connect', '.env'))
 // ── Inbound mode flags ───────────────────────────────────────────────────────
 
 const INBOUND_MODE = flagValue('--inbound')
-if (INBOUND_MODE !== undefined && INBOUND_MODE !== 'tmux' && INBOUND_MODE !== 'herdr') {
-  process.stderr.write(`${SERVER_NAME}: unsupported --inbound "${INBOUND_MODE}" (supported: "tmux", "herdr")\n`)
+if (INBOUND_MODE !== undefined && INBOUND_MODE !== 'tmux' && INBOUND_MODE !== 'herdr' && INBOUND_MODE !== 'tuios') {
+  process.stderr.write(`${SERVER_NAME}: unsupported --inbound "${INBOUND_MODE}" (supported: "tmux", "herdr", "tuios")\n`)
   process.exit(1)
 }
 
@@ -131,7 +135,7 @@ const MUX_TARGET = flagValue('--target')
 const TMUX_SOCK = flagValue('--tmux-sock')
 
 if (INBOUND_MODE !== undefined && !MUX_TARGET) {
-  process.stderr.write(`${SERVER_NAME}: --target is required when --inbound tmux|herdr\n`)
+  process.stderr.write(`${SERVER_NAME}: --target is required when --inbound tmux|herdr|tuios\n`)
   process.exit(1)
 }
 
@@ -139,7 +143,9 @@ const mux: Multiplexer | null = INBOUND_MODE === 'tmux'
   ? new TmuxMultiplexer(TMUX_SOCK)
   : INBOUND_MODE === 'herdr'
     ? new HerdrMultiplexer()
-    : null
+    : INBOUND_MODE === 'tuios'
+      ? new TuiosMultiplexer()
+      : null
 let muxTargetMissingLogged = false
 
 // ── Error + signal handlers ────────────────────────────────────────────────

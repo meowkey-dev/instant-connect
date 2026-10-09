@@ -8,7 +8,7 @@ platform-neutral core:
   optionally buffered/summarized, wrapped in a `<channel ...>` XML tag, and
   delivered to the agent either as MCP `notifications/claude/channel`
   (stdio or SSE transport) or by pasting into a terminal multiplexer pane
-  (tmux and herdr, behind a `Multiplexer` interface).
+  (tmux, herdr and tuios, behind a `Multiplexer` interface).
 - **Outbound** replies go through generic MCP tools (`chat_reply`,
   `chat_react`, `chat_typing`, `fetch_messages`, `upload_file`) routed by
   target platform.
@@ -29,8 +29,8 @@ platform-neutral core:
             │   │  buffers ─ <channel> tag wrap            │          │
             │   └───────┬──────────────────────┬───────────┘          │
             │           │                      │                      │
-            │   core/transport.ts      mux/tmux.ts, mux/herdr.ts (Multiplexer) │
-            │   stdio / SSE MCP        paste + Enter + verify                 │
+            │   core/transport.ts      mux/ (tmux, herdr, tuios)         │
+            │   stdio / SSE MCP        paste / native agent delivery   │
             │   notifications/         into agent pane                │
             │   claude/channel               │                        │
             └───────────┬──────────────────────┼────────────────────────┘
@@ -106,6 +106,11 @@ node dist/server.js --inbound tmux --target mysession:0.0 [--tmux-sock /path/to/
 # herdr native agent delivery — accepts a live agent name or pane ID
 node dist/server.js --inbound herdr --target reviewer
 # named herdr session: --target my-session@reviewer
+
+# tuios native prompt queue — window name, index, UUID, or unique UUID prefix
+node dist/server.js --inbound tuios --target dev@reviewer
+# bare --target reviewer uses TUIOS_SESSION, else the daemon's active session
+# find targets: tuios list-windows -s dev --json
 ```
 
 The MCP server (stdio or SSE) runs in every mode — the mux flag only changes
@@ -116,11 +121,23 @@ platform event queue, so two processes pointed at the same pane would deliver
 duplicates. A lock (atomic `O_EXCL` file under `~/.instant-connect/locks`,
 holder pid + stale-pid reclaim) makes the second process exit with a clear
 error naming the holder's pid; the lock is released on shutdown. With
-`--inbound tmux|herdr` the target must exist at startup: it is canonicalized
+`--inbound tmux|herdr|tuios` the target must exist at startup: it is canonicalized
 (fail-closed) before the lock is taken, so a target that cannot be resolved
 exits with an error instead of starting unprotected. Herdr additionally
 requires a recognized live agent and uses `agent prompt`, which submits via
 the agent's bracketed-paste mode and rejects blocked agents.
+
+Tuios requires its CLI on `PATH` and a running daemon with the native `queue`
+command (verified with 0.8.5). Startup resolves aliases to a stable window UUID,
+so bare and session-qualified aliases share a lock and delivery stays on that
+window when focus changes or the session is renamed. Remote host-qualified
+targets are not supported. `tuios queue` accepts the message immediately, then
+submits it when the recognized agent rests, without typing over an approval or
+question prompt. Success means accepted into the queue; tuios handles paste,
+Enter and submission verification. Inspect pending messages with `tuios queue
+ls -s dev -w reviewer`. The queue holds eight messages by default, each at most
+16 KiB; full queues and oversized messages report delivery failures. Queues
+live in daemon memory and are lost on restart, pane close or agent exit.
 
 ## access.json
 
@@ -166,6 +183,6 @@ node dist/server.js --help
 ```
 
 Layout: `src/core/` platform-neutral modules, `src/platforms/` adapters,
-`src/mux/` multiplexer delivery (tmux, herdr) + the per-pane single-instance
+`src/mux/` multiplexer delivery (tmux, herdr, tuios) + the per-pane single-instance
 lock (`lock.ts`), `src/tools.ts` generic MCP tools, `src/index.ts` entry +
 inbound pipeline. Tests in `test/` (cross-process fixtures in `test/fixtures/`).
