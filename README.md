@@ -8,7 +8,7 @@ platform-neutral core:
   optionally buffered/summarized, wrapped in a `<channel ...>` XML tag, and
   delivered to the agent either as MCP `notifications/claude/channel`
   (stdio or SSE transport) or by pasting into a terminal multiplexer pane
-  (tmux, herdr and tuios, behind a `Multiplexer` interface).
+  (tmux, herdr, tuios and rex, behind a `Multiplexer` interface).
 - **Outbound** replies go through generic MCP tools (`chat_reply`,
   `chat_react`, `chat_typing`, `fetch_messages`, `upload_file`) routed by
   target platform.
@@ -29,7 +29,7 @@ platform-neutral core:
             │   │  buffers ─ <channel> tag wrap            │          │
             │   └───────┬──────────────────────┬───────────┘          │
             │           │                      │                      │
-            │   core/transport.ts      mux/ (tmux, herdr, tuios)         │
+            │   core/transport.ts      mux/ (tmux/herdr/tuios/rex)      │
             │   stdio / SSE MCP        paste / native agent delivery   │
             │   notifications/         into agent pane                │
             │   claude/channel               │                        │
@@ -111,6 +111,10 @@ node dist/server.js --inbound herdr --target reviewer
 node dist/server.js --inbound tuios --target dev@reviewer
 # bare --target reviewer uses TUIOS_SESSION, else the daemon's active session
 # find targets: tuios list-windows -s dev --json
+
+# rex terminal input — block id, label, or id suffix; optional session@ prefix
+node dist/server.js --inbound rex --target 'session:...@block:...'
+# bare --target reviewer uses REX_SESSION; find targets: rex block ls --json
 ```
 
 The MCP server (stdio or SSE) runs in every mode — the mux flag only changes
@@ -121,7 +125,7 @@ platform event queue, so two processes pointed at the same pane would deliver
 duplicates. A lock (atomic `O_EXCL` file under `~/.instant-connect/locks`,
 holder pid + stale-pid reclaim) makes the second process exit with a clear
 error naming the holder's pid; the lock is released on shutdown. With
-`--inbound tmux|herdr|tuios` the target must exist at startup: it is canonicalized
+`--inbound tmux|herdr|tuios|rex` the target must exist at startup: it is canonicalized
 (fail-closed) before the lock is taken, so a target that cannot be resolved
 exits with an error instead of starting unprotected. Herdr additionally
 requires a recognized live agent and uses `agent prompt`, which submits via
@@ -138,6 +142,20 @@ Enter and submission verification. Inspect pending messages with `tuios queue
 ls -s dev -w reviewer`. The queue holds eight messages by default, each at most
 16 KiB; full queues and oversized messages report delivery failures. Queues
 live in daemon memory and are lost on restart, pane close or agent exit.
+
+Rex requires its CLI on `PATH` and a reachable server. Unlike herdr/tuios it has
+no native prompt API, so delivery types the message into the block with `rex
+send` (over stdin, so flag-like or multiline payloads never hit argv) and submits
+it with `rex send-key enter` — the tmux approach, but over Rex's addressing.
+Startup resolves any spelling of a block (label, id suffix, full `block:<uuid>`,
+with an optional `session@` prefix defaulting to `REX_SESSION`) to its stable
+`block:<uuid>` id via `rex block inspect`, so aliases share one lock and delivery
+stays pinned to that block. Submission is verified from the program's own
+`program_status` (OSC 7501): an idle→working transition confirms the Enter
+landed (Claude Code reports this). When a program reports no status — a plain
+shell, or a non-reporting TUI — it falls back to a capture check that the typed
+text is no longer sitting unsubmitted in the input, retrying Enter a few times
+before reporting failure.
 
 ## access.json
 
@@ -183,6 +201,6 @@ node dist/server.js --help
 ```
 
 Layout: `src/core/` platform-neutral modules, `src/platforms/` adapters,
-`src/mux/` multiplexer delivery (tmux, herdr, tuios) + the per-pane single-instance
+`src/mux/` multiplexer delivery (tmux, herdr, tuios, rex) + the per-pane single-instance
 lock (`lock.ts`), `src/tools.ts` generic MCP tools, `src/index.ts` entry +
 inbound pipeline. Tests in `test/` (cross-process fixtures in `test/fixtures/`).

@@ -43,6 +43,8 @@ src/
     ├── mux.ts               # Multiplexer interface (paste/capturePane)
     ├── tmux.ts              # tmux impl (paste-buffer + capture-verify + Enter retries)
     ├── herdr.ts             # herdr CLI impl (send-text + send-keys Enter + read-verify)
+    ├── tuios.ts             # tuios CLI impl (native prompt queue)
+    ├── rex.ts               # rex CLI impl (send + send-key Enter + program_status/capture verify)
     └── lock.ts              # single-instance lock (O_EXCL + stale-pid reclaim)
 test/                        # tsx --test unit tests, one file per module
                              # (test/fixtures/ holds cross-process child fixtures)
