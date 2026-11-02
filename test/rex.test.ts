@@ -182,15 +182,67 @@ describe('deliverToRex', () => {
     assert.equal(calls.filter(c => c.args[0] === 'send-key').length, 3)
   })
 
-  it('accepts once the program is already working from a prior turn', async () => {
-    // Baseline non-idle and still non-idle: cannot distinguish turns, accept.
+  it('verifies via capture when the agent is already busy (mid-turn)', async () => {
+    // Baseline non-idle masks the native transition, so the capture check is the
+    // authority: an empty/fresh prompt means the input cleared → submitted.
     handler = args => {
       if (args[0] === 'block' && args[1] === 'inspect') return { stdout: JSON.stringify({ block: { block_id: blockId } }) }
       if (args[0] === 'block' && args[1] === 'call') return { stdout: status('working') }
+      if (args[0] === 'capture') return { stdout: '❯ \n' }
       return { stdout: '' }
     }
     const r = await deliverToRex({ target: blockId, ...fast }, 'hi', deps)
     assert.deepEqual(r, { ok: true, attempts: 1 })
+    assert.ok(calls.some(c => c.args[0] === 'capture')) // did not blindly trust 'working'
+  })
+
+  it('does NOT report success when busy and the payload is still unsubmitted', async () => {
+    // The finding-1 drop: a non-idle baseline must not short-circuit to ok while
+    // the typed text still sits in the input area.
+    handler = args => {
+      if (args[0] === 'block' && args[1] === 'inspect') return { stdout: JSON.stringify({ block: { block_id: blockId } }) }
+      if (args[0] === 'block' && args[1] === 'call') return { stdout: status('working') }
+      if (args[0] === 'capture') return { stdout: '❯ hold me\n' }
+      return { stdout: '' }
+    }
+    const r = await deliverToRex({ target: blockId, maxRetries: 1, ...fast }, 'hold me', deps)
+    assert.deepEqual(r, { ok: false, error: 'input did not submit', attempts: 2 })
+  })
+
+  it('rejects an empty or whitespace-only payload without pressing Enter', async () => {
+    for (const payload of ['', '   ', '\n\t\n']) {
+      calls = []
+      const r = await deliverToRex({ target: blockId, ...fast }, payload, deps)
+      assert.deepEqual(r, { ok: false, error: 'empty payload', attempts: 0 })
+      assert.equal(calls.length, 0) // no reachability probe, send, or Enter
+    }
+  })
+
+  it('does not treat the tail echoed mid-line in output as still-held input', async () => {
+    // A no-native-signal program that prints the payload back must not provoke
+    // retries: a substring match buried in output is not a pending input line.
+    handler = args => {
+      if (args[0] === 'block' && args[1] === 'inspect') return { stdout: JSON.stringify({ block: { block_id: blockId } }) }
+      if (args[0] === 'block' && args[1] === 'call') return { stdout: status(null) }
+      if (args[0] === 'capture') return { stdout: 'you said: ping — replying now\n❯ \n' }
+      return { stdout: '' }
+    }
+    const r = await deliverToRex({ target: blockId, ...fast }, 'ping', deps)
+    assert.deepEqual(r, { ok: true, attempts: 1 })
+    assert.equal(calls.filter(c => c.args[0] === 'send-key').length, 1) // no spurious retry
+  })
+
+  it('surfaces a failed Enter as a result instead of throwing', async () => {
+    handler = args => {
+      if (args[0] === 'block' && args[1] === 'inspect') return { stdout: JSON.stringify({ block: { block_id: blockId } }) }
+      if (args[0] === 'block' && args[1] === 'call') return { stdout: status('idle') }
+      if (args[0] === 'send-key') return { error: new Error('Command failed'), stderr: 'block is gone' }
+      return { stdout: '' }
+    }
+    const r = await deliverToRex({ target: blockId, ...fast }, 'hi', deps)
+    assert.equal(r.ok, false)
+    assert.equal(r.error, 'block is gone')
+    assert.equal(r.attempts, 0)
   })
 })
 

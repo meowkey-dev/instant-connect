@@ -157,16 +157,27 @@ export async function deliverToRex(
   const verifyMs = config.verifyDelayMs ?? DEFAULT_VERIFY_DELAY_MS
   const maxRetries = config.maxRetries ?? DEFAULT_MAX_RETRIES
 
+  // The payload's last non-empty line anchors the capture-based verify. An empty
+  // or whitespace-only payload has nothing to submit and no anchor to verify —
+  // refuse it rather than press Enter and report a success we can't confirm.
+  const tail = lastLine(payload)
+  if (tail === '') {
+    return { ok: false, error: 'empty payload', attempts: 0 }
+  }
+
   // 1. Reachability — mirrors tmux's "pane not found"; index.ts treats this
   //    error specially (drop-and-suppress rather than a hard failure log).
   if (!(await blockReachable(deps, config))) {
     return { ok: false, error: 'pane not found', attempts: 0 }
   }
 
-  // Baseline run state before we submit, so a verify can tell "already working
-  // for a prior turn" from "our Enter landed". A non-idle baseline means we
-  // cannot use the native signal this attempt; capture is the fallback.
+  // Baseline run state before we submit. A clean idle→non-idle transition is a
+  // reliable "our Enter landed" signal. When the agent is *already* non-idle
+  // (mid-turn), the native state cannot distinguish our submit from the ongoing
+  // turn, so we fall back to the capture check instead of trusting it blindly —
+  // otherwise a busy agent would mark buffered-but-unsubmitted text delivered.
   const baseline = await programState(deps, config)
+  const baselineBusy = submitted(baseline)
 
   // 2. Type the payload. stdin keeps flag-like/huge multiline text out of argv;
   //    the terminal's bracketed-paste mode (if any) absorbs it without
@@ -177,48 +188,71 @@ export async function deliverToRex(
     return { ok: false, error: err instanceof Error ? err.message : String(err), attempts: 0 }
   }
 
-  // 3. Settle, then submit with Enter.
+  // 3. Settle, then submit with Enter. A failed Enter honors the result
+  //    contract rather than throwing out to the pipeline's generic catch.
   await sleep(sleepMs)
-  await execRex(deps, ['send-key', ...blockArgs(config), 'enter'])
+  const enter = await pressEnter(deps, config)
+  if (!enter.ok) return { ok: false, error: enter.error, attempts: 0 }
 
-  // 4. Verify submission. Preferred signal: program_status flips off idle
-  //    (confirmed with Claude Code's OSC 7501 idle→working). When the program
-  //    reports nothing (plain shell / non-reporting TUI), fall back to a
-  //    capture check for the still-unsubmitted payload tail, tmux-style.
+  // 4. Verify submission. Preferred signal: a clean program_status transition to
+  //    non-idle (confirmed with Claude Code's OSC 7501 idle→working). When that
+  //    is unavailable — no native signal (plain shell / non-reporting TUI), or a
+  //    mid-turn baseline that masks the transition — fall back to a capture check
+  //    that the payload tail is no longer sitting unsubmitted in the input.
   let attempts = 1
-  const tail = lastLine(payload)
   await sleep(verifyMs)
 
   while (attempts <= maxRetries) {
     const state = await programState(deps, config)
-    if (state !== null) {
-      // Native signal available. If the baseline was already non-idle we can't
-      // distinguish turns — accept once the program is live (it accepted input
-      // or was already busy); a truly dropped submit is rare and the capture
-      // path below cannot help while an agent is mid-turn anyway.
-      if (submitted(state) || submitted(baseline)) return { ok: true, attempts }
-    } else {
-      // No native signal: confirm the payload tail is no longer sitting in the
-      // input area. A capture read that fails is retried within the budget.
-      let captured: string | null
-      try {
-        captured = await capture(deps, config)
-      } catch {
-        captured = null
-      }
-      if (captured !== null && (tail === '' || !inputStillHolds(captured, tail))) {
-        return { ok: true, attempts }
-      }
+    if (state !== null && !baselineBusy) {
+      // Native signal usable: accept only on a real idle→non-idle transition.
+      if (submitted(state)) return { ok: true, attempts }
+    } else if (await inputCleared(deps, config, tail)) {
+      // No usable native signal: the tail left the input area → submitted.
+      return { ok: true, attempts }
     }
 
     // Retry Enter and re-verify.
     await sleep(RETRY_DELAY_MS)
-    await execRex(deps, ['send-key', ...blockArgs(config), 'enter'])
+    const retry = await pressEnter(deps, config)
+    if (!retry.ok) return { ok: false, error: retry.error, attempts }
     attempts++
     await sleep(RETRY_DELAY_MS)
   }
 
   return { ok: false, error: 'input did not submit', attempts }
+}
+
+/** Press Enter, mapping a thrown CLI error onto the delivery result contract. */
+async function pressEnter(
+  deps: RexInboundDeps,
+  config: RexInboundConfig,
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  try {
+    await execRex(deps, ['send-key', ...blockArgs(config), 'enter'])
+    return { ok: true }
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) }
+  }
+}
+
+/**
+ * Capture-based submission check for the no-native-signal path: true once the
+ * payload tail is no longer sitting unsubmitted in the input area. A capture
+ * read that itself fails is inconclusive (not "cleared") so the caller retries.
+ */
+async function inputCleared(
+  deps: RexInboundDeps,
+  config: RexInboundConfig,
+  tail: string,
+): Promise<boolean> {
+  let captured: string
+  try {
+    captured = await capture(deps, config)
+  } catch {
+    return false
+  }
+  return !inputStillHolds(captured, tail)
 }
 
 /** Last non-empty line of the payload, used as a capture-match anchor. */
@@ -231,17 +265,25 @@ function lastLine(payload: string): string {
   return ''
 }
 
+/** Leading shell/TUI prompt glyphs to strip before matching the input line. */
+const PROMPT_PREFIX = /^[>$❯#%\s]+/
+
 /**
  * Heuristic for the no-native-signal fallback: the payload tail still sits in
- * the input area if the capture's last non-empty line still contains it (i.e.
- * it hasn't scrolled up into submitted output above a fresh prompt). Conservative
- * — a false "still holds" only costs an extra Enter retry.
+ * the input area. Submitted text scrolls up and a fresh (empty) prompt takes the
+ * last line, so we look only at the last non-empty line and, after stripping a
+ * leading prompt glyph, require it to *begin* with the tail — the shape of a
+ * still-pending input line. A mere substring match (the tail echoed mid-line in
+ * the program's own output) no longer counts as held, which stops a program that
+ * prints the payload back from provoking spurious Enter retries. Conservative in
+ * the safe direction: a false "still holds" only costs an extra Enter.
  */
 function inputStillHolds(captured: string, tail: string): boolean {
   const lines = captured.split('\n')
   for (let i = lines.length - 1; i >= 0; i--) {
     const line = lines[i].trim()
-    if (line) return line.includes(tail)
+    if (!line) continue
+    return line.replace(PROMPT_PREFIX, '').startsWith(tail)
   }
   return false
 }

@@ -151,11 +151,13 @@ Startup resolves any spelling of a block (label, id suffix, full `block:<uuid>`,
 with an optional `session@` prefix defaulting to `REX_SESSION`) to its stable
 `block:<uuid>` id via `rex block inspect`, so aliases share one lock and delivery
 stays pinned to that block. Submission is verified from the program's own
-`program_status` (OSC 7501): an idle→working transition confirms the Enter
-landed (Claude Code reports this). When a program reports no status — a plain
-shell, or a non-reporting TUI — it falls back to a capture check that the typed
-text is no longer sitting unsubmitted in the input, retrying Enter a few times
-before reporting failure.
+`program_status` (OSC 7501): a clean idle→working transition confirms the Enter
+landed (Claude Code reports this). When that signal is unavailable — a program
+that reports no status (plain shell / non-reporting TUI), or an agent already
+mid-turn when the message arrives, where the transition is masked — it falls
+back to a capture check that the typed text is no longer sitting unsubmitted in
+the input, retrying Enter a few times before reporting failure. Empty payloads
+are refused; a failed `send`/Enter is reported, never thrown.
 
 ## access.json
 
