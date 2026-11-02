@@ -1,8 +1,9 @@
 /**
  * Mux-target interface — delivery of inbound chat messages to an agent hosted
  * in a terminal multiplexer (for agents without MCP claude/channel support).
- * Implementations may use terminal input (tmux) or a native agent API (herdr,
- * tuios). For queued delivery, success means the daemon accepted the payload.
+ * Implementations may use terminal input (tmux, rex) or a native agent API
+ * (herdr, tuios). For queued delivery, success means the daemon accepted the
+ * payload.
  */
 
 export interface MuxDeliverResult {
